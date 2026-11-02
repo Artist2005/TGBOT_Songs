@@ -72,6 +72,7 @@ from music_download import (
 from cache_db import CacheDB
 
 # === Configuration ===
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STORAGE_CHAT_ID = os.getenv("STORAGE_CHAT_ID")
