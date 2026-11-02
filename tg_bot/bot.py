@@ -171,13 +171,12 @@ TEXTS = {
         "no_results_inline_title": "❌ Нічого не знайдено",
         "no_results_inline_desc": "Не знайдено треків за запитом '{query}'",
         "no_results_inline_msg": "🔍 <b>Нічого не знайдено за запитом:</b> <code>{query}</code>",
-        "downloading_chat": "⏳ Завантажую повний MP3:\n🎵 <b>{artist} — {title}</b>...",
+        "downloading_chat": "⏳ Завантажую повний MP3:\n🎵 <b>{artist} — {title}</b>",
         "download_failed": "❌ <b>Не вдалося завантажити трек:</b>\n🎵 {artist} — {title}",
         "download_toast": "⏳ Завантажую повний MP3 (192 kbps)...",
         "downloading_inline": (
-            "⏳ <b>Завантаження повного MP3...</b>\n"
-            "🎵 {artist} — {title}\n"
-            "<i>Зачекайте кілька секунд, прев'ю заміниться на повний трек...</i>"
+            "⏳ <b>Завантажую повний MP3...</b>\n"
+            "🎵 <b>{artist} — {title}</b>"
         ),
         "deep_link_prompt": (
             "⚠️ <b>Для першого завантаження відкрийте бота один раз:</b>\n"
@@ -188,13 +187,13 @@ TEXTS = {
             "✅ <b>Повний MP3 готовий!</b>\n"
             "📩 Трек надіслано вам у @{bot_name} (або натисніть кнопку нижче, щоб забрати його):"
         ),
-        "btn_download": "📥 Завантажити MP3{dur}",
-        "btn_original": "💿 Оригінал{dur}",
+        "btn_download": "📥 Скачати MP3",
+        "btn_original": "💿 Оригінал",
         "btn_open_download": "📥 Відкрити бота і забрати MP3",
         "btn_top": "🔥 Топ-чарт",
         "btn_favorites": "❤️ Вибране",
-        "btn_fav_add": "🤍 У вибране",
-        "btn_fav_saved": "❤️ У вибраному",
+        "btn_fav_add": "🤍 Вибране",
+        "btn_fav_saved": "❤️ Вибране",
         "btn_lyrics": "📜 Текст",
         "btn_hide_lyrics": "🔙 Сховати текст",
         "btn_effects": "🎛 Ефекти",
@@ -262,13 +261,12 @@ TEXTS = {
         "no_results_inline_title": "❌ No Results Found",
         "no_results_inline_desc": "No music matches found for '{query}'",
         "no_results_inline_msg": "🔍 <b>No results found for:</b> <code>{query}</code>",
-        "downloading_chat": "⏳ Downloading full MP3:\n🎵 <b>{artist} — {title}</b>...",
+        "downloading_chat": "⏳ Downloading full MP3:\n🎵 <b>{artist} — {title}</b>",
         "download_failed": "❌ <b>Could not download track:</b>\n🎵 {artist} — {title}",
         "download_toast": "⏳ Downloading full MP3 (192 kbps)...",
         "downloading_inline": (
             "⏳ <b>Downloading full MP3...</b>\n"
-            "🎵 {artist} — {title}\n"
-            "<i>Please wait a few seconds, the preview will turn into the full track...</i>"
+            "🎵 <b>{artist} — {title}</b>"
         ),
         "deep_link_prompt": (
             "⚠️ <b>Please open the bot once for your first download:</b>\n"
@@ -279,13 +277,13 @@ TEXTS = {
             "✅ <b>Full MP3 is ready!</b>\n"
             "📩 Sent to your DM in @{bot_name} (or tap below to get it):"
         ),
-        "btn_download": "📥 Download MP3{dur}",
-        "btn_original": "💿 Original{dur}",
+        "btn_download": "📥 Get MP3",
+        "btn_original": "💿 Original",
         "btn_open_download": "📥 Open Bot & Get MP3",
         "btn_top": "🔥 Top Chart",
         "btn_favorites": "❤️ Favorites",
         "btn_fav_add": "🤍 Favorite",
-        "btn_fav_saved": "❤️ Saved",
+        "btn_fav_saved": "❤️ Favorite",
         "btn_lyrics": "📜 Lyrics",
         "btn_hide_lyrics": "🔙 Hide Lyrics",
         "btn_effects": "🎛 Effects",
@@ -396,6 +394,20 @@ async def _resolve_track_meta(
     }
 
 
+def _stabilize_caption_width(lines: list[str], target_len: int = 34) -> str:
+    """
+    Додає невидимий фіксатор ширини (\u2800) до останнього рядка підпису,
+    щоб бульбашка повідомлення і кнопки під нею в Telegram завжди мали однакову ширину і не «плигали».
+    """
+    if not lines:
+        return "\u2800" * target_len
+    plain_last = re.sub(r"<[^>]+>", "", lines[-1])
+    pad = max(0, target_len - len(plain_last))
+    if pad > 0:
+        lines[-1] = lines[-1] + ("\u2800" * pad)
+    return "\n".join(lines)
+
+
 def _build_full_caption(
     artist: str,
     title: str,
@@ -404,7 +416,7 @@ def _build_full_caption(
     lang: str = "uk",
     effect_label: str = "",
 ) -> str:
-    """Формує лаконічний та безпечний HTML-підпис для повного MP3 треку."""
+    """Формує лаконічний та безпечний HTML-підпис для повного MP3 треку зі стабільною шириною."""
     t = TEXTS.get(lang, TEXTS["uk"])
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
@@ -415,48 +427,40 @@ def _build_full_caption(
     if duration > 0:
         lines.append(f"⏱ <b>{t['duration_label']}:</b> {format_duration(duration)}")
     lines.append(f"⚡ <b>{t['quality_label']}:</b> 192 kbps MP3")
-    return "\n".join(lines)
+    return _stabilize_caption_width(lines)
 
 
 def _build_preview_caption(
     artist: str, title: str, duration: int = 0, lang: str = "uk"
 ) -> str:
-    """
-    Формує безпечний HTML-підпис для 30-секундного прев'ю.
-    Використовує нерозривні пробіли (\u00A0), щоб ширина повідомлення відповідала кнопці.
-    """
+    """Формує безпечний HTML-підпис для 30-секундного прев'ю зі стабільною шириною."""
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
     duration_str = format_duration(duration) if duration > 0 else "—"
-    nb = "\u00A0"
     if lang == "en":
-        return (
-            f"🎧{nb}<b>{safe_artist}{nb}—{nb}{safe_title}</b>\n"
-            f"🎤{nb}<b>Preview:</b>{nb}30s{nb}•{nb}<b>Full{nb}track:</b>{nb}{duration_str}\n"
-            f"👇{nb}Tap{nb}below{nb}to{nb}download{nb}full{nb}MP3:"
-        )
-    return (
-        f"🎧{nb}<b>{safe_artist}{nb}—{nb}{safe_title}</b>\n"
-        f"🎤{nb}<b>Прев'ю:</b>{nb}30{nb}сек{nb}•{nb}<b>Трек:</b>{nb}{duration_str}\n"
-        f"👇{nb}Натисніть,{nb}щоб{nb}завантажити{nb}MP3:"
-    )
+        lines = [
+            f"🎧 <b>{safe_artist} — {safe_title}</b>",
+            f"🎤 <b>Preview:</b> 30s • <b>Track:</b> {duration_str}",
+        ]
+    else:
+        lines = [
+            f"🎧 <b>{safe_artist} — {safe_title}</b>",
+            f"🎤 <b>Прев'ю:</b> 30 сек • <b>Трек:</b> {duration_str}",
+        ]
+    return _stabilize_caption_width(lines)
 
 
 def _build_download_keyboard(
     deezer_id: int, duration: int = 0, lang: str = "uk"
 ) -> InlineKeyboardMarkup:
-    """Єдина чиста кнопка завантаження повного MP3 під 30-секундним прев'ю."""
-    t = TEXTS.get(lang, TEXTS["uk"])
-    dur_label = f" ({format_duration(duration)})" if duration > 0 else ""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    t["btn_download"].format(dur=dur_label),
-                    callback_data=f"dl:{deezer_id}",
-                )
-            ]
-        ]
+    """Клавіатура 2×2 для прев'ю (завантаження + основні дії однакового розміру)."""
+    return _build_track_actions_keyboard(
+        deezer_id,
+        user_id=None,
+        lang=lang,
+        is_inline=False,
+        include_download=True,
+        duration=duration,
     )
 
 
@@ -471,11 +475,17 @@ def _build_track_actions_keyboard(
     duration: int = 0,
 ) -> InlineKeyboardMarkup:
     """
-    Дворядкова панель дій (2×2) під треком (і в чаті з ботом, і через @ім'я_бота):
-        [ 🤍 У вибране / ❤️ У вибраному ]  [ 📜 Текст ]
-        [ 🎛 Ефекти ]                      [ 📻 Схожі ]
-    Якщо це ще 30-секундне прев'ю (include_download=True), зверху додається кнопка завантаження MP3.
-    Якщо в інлайн-режимі застосовано аудіо-ефект (show_original_btn=True), зверху є кнопка повернення до оригіналу.
+    Суворо симетрична дворядкова панель дій (2×2 = 4 однакові кнопки 50%/50%):
+    - Для повного MP3:
+        [ 🤍 Вибране / ❤️ Вибране ]  [ 📜 Текст ]
+        [ 🎛 Ефекти ]                [ 📻 Схожі ]
+    - Для 30-сек прев'ю (include_download=True):
+        [ 📥 Скачати MP3 ]           [ 🤍 Вибране / ❤️ Вибране ]
+        [ 📜 Текст ]                 [ 🎛 Ефекти ]
+    - Для треку з ефектом в інлайн-режимі (show_original_btn=True):
+        [ 💿 Оригінал ]              [ 🤍 Вибране / ❤️ Вибране ]
+        [ 📜 Текст ]                 [ 🎛 Ефекти ]
+    Усі кнопки мають 1 іконку + короткий підпис однакової довжини, тому ніколи не плигають.
     """
     t = TEXTS.get(lang, TEXTS["uk"])
     is_fav = cache.is_favorite(user_id, deezer_id) if user_id else False
@@ -486,71 +496,74 @@ def _build_track_actions_keyboard(
     lyr_cb = f"lyr{suffix}:{deezer_id}"
     fxm_cb = f"fxm{suffix}:{deezer_id}"
 
-    rows: list[list[InlineKeyboardButton]] = []
-    dur_label = f" ({format_duration(duration)})" if duration > 0 else ""
-
     if include_download:
-        rows.append(
+        return InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    t["btn_download"].format(dur=dur_label),
-                    callback_data=f"dl:{deezer_id}",
-                )
-            ]
-        )
-    elif show_original_btn:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    t["btn_original"].format(dur=dur_label),
-                    callback_data=f"dl:{deezer_id}",
-                )
+                [
+                    InlineKeyboardButton(t["btn_download"], callback_data=f"dl:{deezer_id}"),
+                    InlineKeyboardButton(fav_label, callback_data=fav_cb),
+                ],
+                [
+                    InlineKeyboardButton(t["btn_lyrics"], callback_data=lyr_cb),
+                    InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
+                ],
             ]
         )
 
-    rows.append(
-        [
-            InlineKeyboardButton(fav_label, callback_data=fav_cb),
-            InlineKeyboardButton(t["btn_lyrics"], callback_data=lyr_cb),
-        ]
-    )
+    if show_original_btn:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(t["btn_original"], callback_data=f"dl:{deezer_id}"),
+                    InlineKeyboardButton(fav_label, callback_data=fav_cb),
+                ],
+                [
+                    InlineKeyboardButton(t["btn_lyrics"], callback_data=lyr_cb),
+                    InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
+                ],
+            ]
+        )
 
     if is_inline:
         similar_query = artist if artist and artist != "Unknown Artist" else ""
-        rows.append(
-            [
-                InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
-                InlineKeyboardButton(
-                    t["btn_similar"],
-                    switch_inline_query_current_chat=similar_query,
-                ),
-            ]
+        similar_btn = InlineKeyboardButton(
+            t["btn_similar"],
+            switch_inline_query_current_chat=similar_query,
         )
     else:
-        rows.append(
-            [
-                InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
-                InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
-            ]
+        similar_btn = InlineKeyboardButton(
+            t["btn_similar"],
+            callback_data=f"sim:{deezer_id}",
         )
 
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(fav_label, callback_data=fav_cb),
+                InlineKeyboardButton(t["btn_lyrics"], callback_data=lyr_cb),
+            ],
+            [
+                InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
+                similar_btn,
+            ],
+        ]
+    )
 
 
 def _build_effects_submenu_keyboard(
     deezer_id: int, lang: str = "uk", is_preview: bool = False
 ) -> InlineKeyboardMarkup:
-    """Дворядкове підменю вибору аудіо-ефектів (2×2)."""
+    """Суворо симетричне дворядкове підменю вибору аудіо-ефектів (2×2 = 4 однакові кнопки)."""
     t = TEXTS.get(lang, TEXTS["uk"])
     back_cb = f"fxbp:{deezer_id}" if is_preview else f"fxb:{deezer_id}"
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🌙 Slowed + Reverb", callback_data=f"fx:slowed:{deezer_id}"),
+                InlineKeyboardButton("🌙 Slowed", callback_data=f"fx:slowed:{deezer_id}"),
                 InlineKeyboardButton("⚡ Speed Up", callback_data=f"fx:speedup:{deezer_id}"),
             ],
             [
-                InlineKeyboardButton("🔊 Bass Boost", callback_data=f"fx:bass:{deezer_id}"),
+                InlineKeyboardButton("🔊 Bass", callback_data=f"fx:bass:{deezer_id}"),
                 InlineKeyboardButton(t["btn_back"], callback_data=back_cb),
             ],
         ]
@@ -1558,6 +1571,10 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     lang = _get_lang(query.from_user)
     t = TEXTS[lang]
+    if query.data == "lyr:noop":
+        await query.answer()
+        return
+
     parts = query.data.split(":")
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await query.answer(t["invalid_data"])
@@ -1628,8 +1645,8 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if is_inline:
         # В інлайн-повідомленні ліміт підпису (caption) у Telegram — 1024 символи,
         # тому розбиваємо довгий текст пісні на зручні сторінки з кнопками ⬅️ / ➡️
-        header = f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
-        max_page_chars = max(350, 780 - len(header))
+        header = _stabilize_caption_width([f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>"]) + "\n"
+        max_page_chars = max(350, 760 - len(header))
         pages = _paginate_lyrics(lyrics, max_page_chars)
         total_pages = len(pages)
         page = max(0, min(page, total_pages - 1))
@@ -1640,19 +1657,18 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         inline_caption = f"{header}<blockquote>{pages[page]}</blockquote>"
         kb_rows = []
         if total_pages > 1:
-            nav_row = []
-            if page > 0:
-                nav_row.append(
-                    InlineKeyboardButton("⬅️", callback_data=f"{lyr_prefix}:{deezer_id}:{page - 1}")
-                )
-            nav_row.append(
-                InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"{lyr_prefix}:{deezer_id}:{page}")
+            prev_btn = (
+                InlineKeyboardButton("⬅️", callback_data=f"{lyr_prefix}:{deezer_id}:{page - 1}")
+                if page > 0
+                else InlineKeyboardButton("·", callback_data="lyr:noop")
             )
-            if page < total_pages - 1:
-                nav_row.append(
-                    InlineKeyboardButton("➡️", callback_data=f"{lyr_prefix}:{deezer_id}:{page + 1}")
-                )
-            kb_rows.append(nav_row)
+            page_btn = InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="lyr:noop")
+            next_btn = (
+                InlineKeyboardButton("➡️", callback_data=f"{lyr_prefix}:{deezer_id}:{page + 1}")
+                if page < total_pages - 1
+                else InlineKeyboardButton("·", callback_data="lyr:noop")
+            )
+            kb_rows.append([prev_btn, page_btn, next_btn])
 
         kb_rows.append(
             [InlineKeyboardButton(t["btn_hide_lyrics"], callback_data=f"{lyrc_prefix}:{deezer_id}")]
@@ -1670,9 +1686,10 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # У звичайному чаті ліміт повідомлення — 4096 символів (вміщує всю пісню цілком, або з пагінацією для дуже довгих)
-    header = t["lyrics_header"].format(
+    raw_header = t["lyrics_header"].format(
         artist=html.escape(artist), title=html.escape(title)
     )
+    header = _stabilize_caption_width([raw_header])
     pages = _paginate_lyrics(lyrics, 3600)
     total_pages = len(pages)
     page = max(0, min(page, total_pages - 1))
@@ -1680,19 +1697,18 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     text_body = f"{header}\n\n<blockquote>{pages[page]}</blockquote>"
     kb_rows = []
     if total_pages > 1:
-        nav_row = []
-        if page > 0:
-            nav_row.append(
-                InlineKeyboardButton("⬅️", callback_data=f"lyr:{deezer_id}:{page - 1}")
-            )
-        nav_row.append(
-            InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"lyr:{deezer_id}:{page}")
+        prev_btn = (
+            InlineKeyboardButton("⬅️", callback_data=f"lyr:{deezer_id}:{page - 1}")
+            if page > 0
+            else InlineKeyboardButton("·", callback_data="lyr:noop")
         )
-        if page < total_pages - 1:
-            nav_row.append(
-                InlineKeyboardButton("➡️", callback_data=f"lyr:{deezer_id}:{page + 1}")
-            )
-        kb_rows.append(nav_row)
+        page_btn = InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="lyr:noop")
+        next_btn = (
+            InlineKeyboardButton("➡️", callback_data=f"lyr:{deezer_id}:{page + 1}")
+            if page < total_pages - 1
+            else InlineKeyboardButton("·", callback_data="lyr:noop")
+        )
+        kb_rows.append([prev_btn, page_btn, next_btn])
 
     kb_rows.append([InlineKeyboardButton(t["btn_close"], callback_data="delmsg")])
 
