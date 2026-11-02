@@ -1,5 +1,6 @@
 """
-Модуль кешування метаданих треків, Telegram file_id та мовних налаштувань через SQLite + RAM-кеш.
+Модуль кешування метаданих треків, Telegram file_id, вибраного, аудіо-ефектів
+та мовних налаштувань через SQLite + RAM-кеш.
 Використовує WAL-режим та оперативний кеш у пам'яті для миттєвого доступу (0 мс затримки при пошуку).
 """
 
@@ -15,13 +16,15 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
 
 
 class CacheDB:
-    """Швидкий SQLite + in-memory кеш для метаданих треків, file_id та мови користувача."""
+    """Швидкий SQLite + in-memory кеш для метаданих треків, file_id, ефектів, вибраного та мови."""
 
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._file_ids: dict[int, str] = {}
         self._meta: dict[int, dict] = {}
         self._langs: dict[int, str] = {}
+        self._favorites: dict[int, list[int]] = {}
+        self._effects: dict[tuple[int, str], str] = {}
         self._init_db()
         self._preload_memory_cache()
 
@@ -70,6 +73,25 @@ class CacheDB:
                     )
                 """)
 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_favorites (
+                        user_id INTEGER NOT NULL,
+                        deezer_id INTEGER NOT NULL,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, deezer_id)
+                    )
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS effect_cache (
+                        deezer_id INTEGER NOT NULL,
+                        effect TEXT NOT NULL,
+                        file_id TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (deezer_id, effect)
+                    )
+                """)
+
                 cursor = conn.execute("PRAGMA table_info(track_cache)")
                 existing_cols = {row[1] for row in cursor.fetchall()}
                 migrations = {
@@ -91,7 +113,7 @@ class CacheDB:
             logger.error(f"Failed to initialize cache DB: {e}")
 
     def _preload_memory_cache(self):
-        """Завантажує file_id, останні метадані та мовні налаштування в оперативну пам'ять."""
+        """Завантажує file_id, останні метадані, вибране, ефекти та мовні налаштування в RAM."""
         try:
             with closing(self._connect()) as conn:
                 conn.row_factory = sqlite3.Row
@@ -130,6 +152,20 @@ class CacheDB:
                 for row in conn.execute("SELECT user_id, lang FROM user_prefs"):
                     self._langs[int(row["user_id"])] = row["lang"]
 
+                for row in conn.execute(
+                    "SELECT user_id, deezer_id FROM user_favorites ORDER BY added_at DESC"
+                ):
+                    uid = int(row["user_id"])
+                    did = int(row["deezer_id"])
+                    self._favorites.setdefault(uid, [])
+                    if did not in self._favorites[uid]:
+                        self._favorites[uid].append(did)
+
+                for row in conn.execute(
+                    "SELECT deezer_id, effect, file_id FROM effect_cache"
+                ):
+                    self._effects[(int(row["deezer_id"]), str(row["effect"]))] = row["file_id"]
+
                 logger.info(
                     f"Preloaded {len(self._file_ids)} cached files and {len(self._meta)} tracks into RAM"
                 )
@@ -145,7 +181,7 @@ class CacheDB:
         rows = []
         for track in tracks:
             deezer_id = track.get("id")
-            if not deezer_id:
+            if deezer_id is None:
                 continue
             did = int(deezer_id)
             normalized = {
@@ -271,6 +307,16 @@ class CacheDB:
         """Зберігає file_id завантаженого MP3 у RAM та SQLite."""
         deezer_id = int(deezer_id)
         self._file_ids[deezer_id] = file_id
+        if deezer_id not in self._meta:
+            self._meta[deezer_id] = {
+                "id": deezer_id,
+                "title": title or "Unknown Title",
+                "artist": artist or "Unknown Artist",
+                "album": album or "",
+                "duration": int(duration or 0),
+                "cover_url": cover_url or "",
+                "preview_url": "",
+            }
         try:
             with closing(self._connect()) as conn:
                 conn.execute(
@@ -302,6 +348,97 @@ class CacheDB:
         except sqlite3.Error as e:
             logger.error(f"Cache delete error: {e}")
 
+    # === Вибране (Favorites) ===
+    def is_favorite(self, user_id: int, deezer_id: int) -> bool:
+        """Перевіряє, чи є трек у вибраному користувача (миттєво з RAM)."""
+        return int(deezer_id) in self._favorites.get(int(user_id), [])
+
+    def toggle_favorite(self, user_id: int, deezer_id: int) -> bool:
+        """
+        Додає або видаляє трек із вибраного користувача.
+        Повертає True, якщо трек додано, або False, якщо видалено.
+        """
+        uid = int(user_id)
+        did = int(deezer_id)
+        favs = self._favorites.setdefault(uid, [])
+
+        if did in favs:
+            favs.remove(did)
+            try:
+                with closing(self._connect()) as conn:
+                    conn.execute(
+                        "DELETE FROM user_favorites WHERE user_id = ? AND deezer_id = ?",
+                        (uid, did),
+                    )
+                    conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Failed to remove favorite ({uid}, {did}): {e}")
+            return False
+        else:
+            favs.insert(0, did)
+            try:
+                with closing(self._connect()) as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO user_favorites (user_id, deezer_id, added_at)
+                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (uid, did),
+                    )
+                    conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Failed to add favorite ({uid}, {did}): {e}")
+            return True
+
+    def get_user_favorites(self, user_id: int, limit: int = 25) -> list[dict]:
+        """Повертає список улюблених треків користувача з метаданими."""
+        uid = int(user_id)
+        fav_ids = self._favorites.get(uid, [])[:limit]
+        tracks = []
+        for did in fav_ids:
+            meta = self.get_track_meta(did)
+            if meta:
+                tracks.append(meta)
+        return tracks
+
+    # === Кеш аудіо-ефектів (Slowed / Speed Up / Bass Boost) ===
+    def get_effect_file_id(self, deezer_id: int, effect: str) -> Optional[str]:
+        """Отримує закешований file_id для треку з аудіо-ефектом."""
+        key = (int(deezer_id), str(effect))
+        if key in self._effects:
+            return self._effects[key]
+        try:
+            with closing(self._connect()) as conn:
+                cursor = conn.execute(
+                    "SELECT file_id FROM effect_cache WHERE deezer_id = ? AND effect = ?",
+                    key,
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    self._effects[key] = row[0]
+                    return row[0]
+        except sqlite3.Error as e:
+            logger.debug(f"Could not read effect cache {key}: {e}")
+        return None
+
+    def save_effect_file_id(self, deezer_id: int, effect: str, file_id: str):
+        """Зберігає file_id для обробленого ефектом треку."""
+        key = (int(deezer_id), str(effect))
+        self._effects[key] = file_id
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO effect_cache (deezer_id, effect, file_id, created_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (key[0], key[1], file_id),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to save effect cache {key}: {e}")
+
+    # === Мовні налаштування ===
     def get_user_lang(self, user_id: int) -> Optional[str]:
         """Повертає збережену мову користувача ('uk' або 'en') або None."""
         user_id = int(user_id)

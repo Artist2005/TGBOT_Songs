@@ -1,14 +1,22 @@
 """
-Telegram Inline & Direct Music Bot (UA 🇺🇦 / EN 🇬🇧).
-Швидкий пошук через Deezer API (Keep-Alive + RAM-кеш), 30-секундні голосові прев'ю (Voice)
-та багатопотокове завантаження повних MP3 треків (192 kbps) через yt-dlp з кешуванням у SQLite.
+Telegram Inline Music Bot (UA / EN).
+Швидкий пошук та завантаження MP3 у будь-якому чаті (Inline + Direct Chat):
+- Чарти при порожньому @bot та /top
+- Завантаження за посиланнями (YouTube, Shorts, SoundCloud, TikTok, Reels, Spotify)
+- Вибране / власний плейлист (❤️ + /favorites + @bot fav)
+- Тексти пісень (📜 Текст у згортаному блоці)
+- Аудіо-ефекти в 1 клік (🌙 Slowed + Reverb, ⚡ Speed Up, 🔊 Bass Boost)
+- Схожі треки (📻 Схожі)
 """
 
 import os
+import re
 import io
 import html
+import zlib
 import asyncio
 import logging
+import tempfile
 from uuid import uuid4
 from typing import Optional
 from dotenv import load_dotenv
@@ -16,16 +24,17 @@ from dotenv import load_dotenv
 from telegram import (
     Update,
     User,
+    BotCommand,
     InlineQueryResultArticle,
     InlineQueryResultAudio,
-    InlineQueryResultVoice,
     InlineQueryResultCachedAudio,
+    InlineQueryResultsButton,
     InputTextMessageContent,
     InputMediaAudio,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -40,7 +49,11 @@ from telegram.ext import (
 
 from music_search import (
     search_tracks,
+    get_chart_tracks,
     get_track_by_id,
+    get_similar_tracks,
+    get_track_lyrics,
+    resolve_spotify_query,
     download_url_bytes,
     format_duration,
     warmup_session,
@@ -48,6 +61,10 @@ from music_search import (
 )
 from music_download import (
     download_track,
+    download_from_url,
+    extract_supported_url,
+    is_spotify_url,
+    apply_audio_effect,
     convert_preview_to_ogg,
     cleanup_file,
     cleanup_temp_dir,
@@ -63,169 +80,246 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Ініціалізація SQLite + RAM кешу
 cache = CacheDB()
-
-# Локи для уникнення дублювання паралельних завантажень одного й того ж треку
-_download_locks: dict[int, asyncio.Lock] = {}
+_download_locks: dict[str, asyncio.Lock] = {}
 
 SILENT_FALLBACK_URL = (
     "https://raw.githubusercontent.com/anars/blank-audio/master/1-second-of-silence.mp3"
 )
 
-# === Двомовні тексти (UA / EN) ===
+EFFECT_LABELS = {
+    "uk": {
+        "slowed": "🌙 Slowed + Reverb",
+        "speedup": "⚡ Speed Up",
+        "bass": "🔊 Bass Boost",
+    },
+    "en": {
+        "slowed": "🌙 Slowed + Reverb",
+        "speedup": "⚡ Speed Up",
+        "bass": "🔊 Bass Boost",
+    },
+}
+
+# === Двомовні тексти (Українська / English) ===
 TEXTS = {
     "uk": {
         "welcome": (
-            "🎵 <b>Вітаю у Music Explorer Bot!</b>\n\n"
-            "Шукайте музику, слухайте <b>30-секундне голосове прев'ю</b> без зайвого скачування "
-            "та завантажуйте лише ті треки, які вам підходять!\n\n"
-            "✨ <b>Як користуватися:</b>\n"
-            "1️⃣ <b>Прямо в цьому чаті:</b> просто напишіть назву пісні або виконавця.\n"
-            "2️⃣ <b>У будь-якому іншому чаті чи групі:</b> введіть <code>@{bot_name} назва пісні</code>.\n"
-            "3️⃣ Прослухайте 30-секундне голосове прев'ю 🎤.\n"
-            "4️⃣ Натисніть <b>«📥 Завантажити MP3»</b>, щоб отримати весь трек!\n\n"
-            "🔍 <b>Приклади:</b>\n"
-            "• <code>@{bot_name} Imagine Dragons Believer</code>\n"
-            "• <code>@{bot_name} Океан Ельзи Обійми</code>\n\n"
-            "⚡ <i>Треки з кешу відправляються миттєво! Змінити мову: /lang</i>"
+            "🎵 <b>Вітаємо у Music Explorer Bot!</b>\n\n"
+            "Шукайте, слухайте 30-секундні уривки та завантажуйте повні MP3 у будь-якому чаті!\n\n"
+            "✨ <b>Можливості:</b>\n"
+            "• <b>Інлайн у будь-якому чаті:</b> введіть <code>@{bot_name} назва пісні</code> (або просто <code>@{bot_name} </code> для Топ-чарту)\n"
+            "• <b>Пошук у чаті:</b> просто напишіть назву пісні або виконавця\n"
+            "• <b>Посилання:</b> надішліть лінк із <b>YouTube, Shorts, TikTok, SoundCloud, Reels</b> або <b>Spotify</b> — бот миттєво витягне MP3\n"
+            "• <b>Під кожним треком:</b> ❤️ Вибране • 📜 Текст • 🎛 Ефекти (Slowed / Speed Up / Bass) • 📻 Схожі\n\n"
+            "📌 <b>Команди:</b> /top — Хіти • /favorites — Вибране • /lang — Мова"
         ),
-        "lang_prompt": "🌐 <b>Оберіть мову інтерфейсу / Choose your language:</b>",
-        "lang_changed": "✅ Мову змінено на <b>Українську 🇺🇦</b>",
+        "lang_prompt": "🌐 <b>Оберіть мову інтерфейсу / Choose language:</b>",
+        "lang_changed": "✅ <b>Мову змінено на Українську!</b>",
         "searching": "🔍 Шукаю: <b>{query}</b>...",
-        "no_results_chat": (
-            "❌ За запитом <b>{query}</b> нічого не знайдено.\n"
-            "Спробуйте іншу назву пісні або виконавця."
-        ),
+        "no_results_chat": "😔 Нічого не знайдено за запитом: <b>{query}</b>",
         "search_results_header": (
-            "🎶 <b>Результати пошуку для:</b> <code>{query}</code>\n"
-            "Оберіть трек для 30-сек голосового прев'ю або завантаження MP3:"
+            "🎧 <b>Результати для:</b> <code>{query}</code>\n"
+            "<i>Оберіть трек (⚡ — миттєво з кешу, 🎤 — 30 сек прев'ю):</i>"
+        ),
+        "top_header": (
+            "🔥 <b>Топ-10 світових хітів зараз:</b>\n"
+            "<i>Натисніть на трек, щоб прослухати або завантажити:</i>"
+        ),
+        "fav_header": (
+            "❤️ <b>Ваш плейлист «Вибране» ({count}):</b>\n"
+            "<i>Також доступний у будь-якому чаті через</i> <code>@{bot_name} fav</code>"
+        ),
+        "fav_empty": (
+            "🤍 <b>У вашому «Вибраному» поки порожньо.</b>\n"
+            "Натисніть <b>🤍</b> під будь-яким завантаженим треком, щоб зберегти його сюди!"
+        ),
+        "fav_added_toast": "❤️ Додано у Вибране (/favorites)",
+        "fav_removed_toast": "💔 Видалено з Вибраного",
+        "fav_inline_btn": "❤️ Моє вибране ({count})",
+        "similar_header": "📻 <b>Схожі треки та хіти {artist}:</b>",
+        "similar_empty": "😔 Не знайдено схожих треків.",
+        "lyrics_header": "📜 <b>{artist} — {title}</b>",
+        "lyrics_not_found": "😔 Текст для <b>{artist} — {title}</b> не знайдено.",
+        "lyrics_loading_toast": "📜 Шукаю текст пісні...",
+        "effect_loading_toast": "🎛 Створюю версію {effect}...",
+        "effect_processing": "🎛 Обробляю <b>{effect}</b>:\n🎵 <b>{artist} — {title}</b>...",
+        "effect_failed": "❌ Не вдалося обробити аудіо-ефект.",
+        "url_downloading": "🔗 Завантажую аудіо за посиланням...",
+        "url_failed": "❌ Не вдалося завантажити аудіо за цим посиланням.",
+        "preview_toast": "🎤 Надсилаю 30-секундне прев'ю...",
+        "no_preview_available": (
+            "🎵 <b>{artist} — {title}</b>\n"
+            "<i>Прев'ю недоступне. Натисніть нижче, щоб завантажити повний MP3:</i>"
         ),
         "no_results_inline_title": "❌ Нічого не знайдено",
         "no_results_inline_desc": "Не знайдено треків за запитом '{query}'",
-        "no_results_inline_msg": (
-            "🔍 <b>Нічого не знайдено за запитом:</b> <code>{query}</code>\n"
-            "Спробуйте іншу назву пісні."
+        "no_results_inline_msg": "🔍 <b>Нічого не знайдено за запитом:</b> <code>{query}</code>",
+        "downloading_chat": "⏳ Завантажую повний MP3:\n🎵 <b>{artist} — {title}</b>...",
+        "download_failed": "❌ <b>Не вдалося завантажити трек:</b>\n🎵 {artist} — {title}",
+        "download_toast": "⏳ Завантажую повний MP3 (192 kbps)...",
+        "downloading_inline": (
+            "⏳ <b>Завантаження повного MP3...</b>\n"
+            "🎵 {artist} — {title}\n"
+            "<i>Зачекайте кілька секунд, прев'ю заміниться на повний трек...</i>"
         ),
+        "deep_link_prompt": (
+            "⚠️ <b>Для першого завантаження відкрийте бота один раз:</b>\n"
+            "🎵 <b>{artist} — {title}</b>\n\n"
+            "👇 Натисніть кнопку нижче — трек надішлеться автоматично:"
+        ),
+        "ready_fallback": (
+            "✅ <b>Повний MP3 готовий!</b>\n"
+            "📩 Трек надіслано вам у @{bot_name} (або натисніть кнопку нижче, щоб забрати його):"
+        ),
+        "btn_download": "📥 Завантажити MP3{dur}",
+        "btn_open_download": "📥 Відкрити бота і забрати MP3",
+        "btn_top": "🔥 Топ-чарт",
+        "btn_favorites": "❤️ Вибране",
+        "btn_lyrics": "📜 Текст",
+        "btn_hide_lyrics": "🔙 Сховати текст",
+        "btn_effects": "🎛 Ефекти",
+        "btn_similar": "📻 Схожі",
+        "btn_back": "🔙",
+        "btn_close": "✖️ Закрити",
         "album_label": "Альбом",
         "duration_label": "Тривалість",
         "quality_label": "Якість",
-        "btn_download": "📥 Завантажити MP3{dur}",
-        "btn_open_download": "📥 Завантажити MP3",
-        "preview_toast": "🎤 Завантажую 30-сек голосове прев'ю...",
-        "download_toast": "⏳ Завантажую повний MP3...",
-        "invalid_data": "❌ Невірні дані запиту",
-        "no_preview_available": (
-            "🎧 <b>{artist} — {title}</b>\n"
-            "<i>(Для цього треку 30-сек прев'ю недоступне в Deezer)</i>\n"
-            "👇 Натисніть, щоб завантажити MP3:"
-        ),
-        "downloading_chat": (
-            "⏳ <b>Завантажую повний MP3 (192 kbps)...</b>\n"
-            "🎵 <b>{artist} — {title}</b>"
-        ),
-        "downloading_inline": (
-            "⏳\u00A0<b>Завантажую\u00A0MP3\u00A0(192\u00A0kbps)...</b>\n"
-            "🎵\u00A0<b>{artist}\u00A0—\u00A0{title}</b>\n"
-            "<i>Зачекайте\u00A0кілька\u00A0секунд...</i>"
-        ),
-        "download_failed": "❌ <b>Не вдалося завантажити трек:</b>\n🎵 {artist} — {title}",
-        "deep_link_prompt": (
-            "⚠️\u00A0<b>Щоб\u00A0завантажити\u00A0цей\u00A0трек:</b>\n"
-            "Натисніть\u00A0кнопку\u00A0нижче\u00A0(<b>{artist}\u00A0—\u00A0{title}</b>):"
-        ),
-        "ready_fallback": (
-            "✅\u00A0<b>Повний\u00A0MP3\u00A0готовий!</b>\n"
-            "Натисніть\u00A0кнопку\u00A0нижче\u00A0або\u00A0<code>@{bot_name}\u00A0{title}</code>:"
-        ),
+        "invalid_data": "❌ Некоректні дані треку",
+        "cmd_start": "Головне меню та інструкція",
+        "cmd_top": "Топ-10 світових хітів",
+        "cmd_fav": "Ваші збережені треки (Вибране)",
+        "cmd_lang": "Змінити мову (🇺🇦 / 🇬🇧)",
     },
     "en": {
         "welcome": (
             "🎵 <b>Welcome to Music Explorer Bot!</b>\n\n"
-            "Search for music, listen to a <b>30-second voice preview</b> without downloading heavy files, "
-            "and download only the full MP3 tracks you want!\n\n"
-            "✨ <b>How to use:</b>\n"
-            "1️⃣ <b>Directly in this chat:</b> just send a song title or artist name.\n"
-            "2️⃣ <b>In any other chat or group:</b> type <code>@{bot_name} song title</code>.\n"
-            "3️⃣ Listen to the 30-second voice preview 🎤.\n"
-            "4️⃣ Tap <b>«📥 Download MP3»</b> to get the full track!\n\n"
-            "🔍 <b>Examples:</b>\n"
-            "• <code>@{bot_name} Imagine Dragons Believer</code>\n"
-            "• <code>@{bot_name} Three Days Grace Animal</code>\n\n"
-            "⚡ <i>Cached tracks are delivered instantly! Change language: /lang</i>"
+            "Search, listen to 30-second previews, and download full MP3 tracks in any chat!\n\n"
+            "✨ <b>Features:</b>\n"
+            "• <b>Inline in any chat:</b> type <code>@{bot_name} song name</code> (or just <code>@{bot_name} </code> for Top Chart)\n"
+            "• <b>Chat search:</b> simply send a song title or artist name\n"
+            "• <b>Direct Links:</b> send a link from <b>YouTube, Shorts, TikTok, SoundCloud, Reels</b> or <b>Spotify</b> to get MP3\n"
+            "• <b>Under every track:</b> ❤️ Favorites • 📜 Lyrics • 🎛 Effects (Slowed / Speed Up / Bass) • 📻 Similar\n\n"
+            "📌 <b>Commands:</b> /top — Top Chart • /favorites — Favorites • /lang — Language"
         ),
-        "lang_prompt": "🌐 <b>Choose your language / Оберіть мову інтерфейсу:</b>",
-        "lang_changed": "✅ Language set to <b>English 🇬🇧</b>",
+        "lang_prompt": "🌐 <b>Choose interface language / Оберіть мову:</b>",
+        "lang_changed": "✅ <b>Language set to English!</b>",
         "searching": "🔍 Searching: <b>{query}</b>...",
-        "no_results_chat": (
-            "❌ No results found for <b>{query}</b>.\n"
-            "Try another song title or artist."
-        ),
+        "no_results_chat": "😔 No results found for: <b>{query}</b>",
         "search_results_header": (
-            "🎶 <b>Search results for:</b> <code>{query}</code>\n"
-            "Select a track for a 30-sec voice preview or full MP3:"
+            "🎧 <b>Results for:</b> <code>{query}</code>\n"
+            "<i>Select a track (⚡ — instant from cache, 🎤 — 30s preview):</i>"
+        ),
+        "top_header": (
+            "🔥 <b>Top 10 Global Hits Right Now:</b>\n"
+            "<i>Tap a track to preview or download:</i>"
+        ),
+        "fav_header": (
+            "❤️ <b>Your Favorites Playlist ({count}):</b>\n"
+            "<i>Also available in any chat via</i> <code>@{bot_name} fav</code>"
+        ),
+        "fav_empty": (
+            "🤍 <b>Your Favorites playlist is empty.</b>\n"
+            "Tap <b>🤍</b> under any downloaded track to save it here!"
+        ),
+        "fav_added_toast": "❤️ Added to Favorites (/favorites)",
+        "fav_removed_toast": "💔 Removed from Favorites",
+        "fav_inline_btn": "❤️ My Favorites ({count})",
+        "similar_header": "📻 <b>Similar tracks & hits by {artist}:</b>",
+        "similar_empty": "😔 No similar tracks found.",
+        "lyrics_header": "📜 <b>{artist} — {title}</b>",
+        "lyrics_not_found": "😔 Lyrics for <b>{artist} — {title}</b> were not found.",
+        "lyrics_loading_toast": "📜 Fetching lyrics...",
+        "effect_loading_toast": "🎛 Creating {effect} version...",
+        "effect_processing": "🎛 Processing <b>{effect}</b>:\n🎵 <b>{artist} — {title}</b>...",
+        "effect_failed": "❌ Could not process audio effect.",
+        "url_downloading": "🔗 Downloading audio from link...",
+        "url_failed": "❌ Could not download audio from this link.",
+        "preview_toast": "🎤 Sending 30s voice preview...",
+        "no_preview_available": (
+            "🎵 <b>{artist} — {title}</b>\n"
+            "<i>Preview unavailable. Tap below to download the full MP3:</i>"
         ),
         "no_results_inline_title": "❌ No Results Found",
-        "no_results_inline_desc": "No tracks found for '{query}'",
-        "no_results_inline_msg": (
-            "🔍 <b>No results found for:</b> <code>{query}</code>\n"
-            "Try a different search query."
+        "no_results_inline_desc": "No music matches found for '{query}'",
+        "no_results_inline_msg": "🔍 <b>No results found for:</b> <code>{query}</code>",
+        "downloading_chat": "⏳ Downloading full MP3:\n🎵 <b>{artist} — {title}</b>...",
+        "download_failed": "❌ <b>Could not download track:</b>\n🎵 {artist} — {title}",
+        "download_toast": "⏳ Downloading full MP3 (192 kbps)...",
+        "downloading_inline": (
+            "⏳ <b>Downloading full MP3...</b>\n"
+            "🎵 {artist} — {title}\n"
+            "<i>Please wait a few seconds, the preview will turn into the full track...</i>"
         ),
+        "deep_link_prompt": (
+            "⚠️ <b>Please open the bot once for your first download:</b>\n"
+            "🎵 <b>{artist} — {title}</b>\n\n"
+            "👇 Tap the button below — your track will be sent automatically:"
+        ),
+        "ready_fallback": (
+            "✅ <b>Full MP3 is ready!</b>\n"
+            "📩 Sent to your DM in @{bot_name} (or tap below to get it):"
+        ),
+        "btn_download": "📥 Download MP3{dur}",
+        "btn_open_download": "📥 Open Bot & Get MP3",
+        "btn_top": "🔥 Top Chart",
+        "btn_favorites": "❤️ Favorites",
+        "btn_lyrics": "📜 Lyrics",
+        "btn_hide_lyrics": "🔙 Hide Lyrics",
+        "btn_effects": "🎛 Effects",
+        "btn_similar": "📻 Similar",
+        "btn_back": "🔙",
+        "btn_close": "✖️ Close",
         "album_label": "Album",
         "duration_label": "Duration",
         "quality_label": "Quality",
-        "btn_download": "📥 Download MP3{dur}",
-        "btn_open_download": "📥 Download MP3",
-        "preview_toast": "🎤 Loading 30-sec voice preview...",
-        "download_toast": "⏳ Downloading full MP3...",
-        "invalid_data": "❌ Invalid request data",
-        "no_preview_available": (
-            "🎧 <b>{artist} — {title}</b>\n"
-            "<i>(30-sec preview is unavailable on Deezer for this track)</i>\n"
-            "👇 Tap below to download the full MP3:"
-        ),
-        "downloading_chat": (
-            "⏳ <b>Downloading full MP3 (192 kbps)...</b>\n"
-            "🎵 <b>{artist} — {title}</b>"
-        ),
-        "downloading_inline": (
-            "⏳\u00A0<b>Downloading\u00A0MP3\u00A0(192\u00A0kbps)...</b>\n"
-            "🎵\u00A0<b>{artist}\u00A0—\u00A0{title}</b>\n"
-            "<i>Please\u00A0wait\u00A0a\u00A0few\u00A0seconds...</i>"
-        ),
-        "download_failed": "❌ <b>Could not download track:</b>\n🎵 {artist} — {title}",
-        "deep_link_prompt": (
-            "⚠️\u00A0<b>To\u00A0download\u00A0this\u00A0track:</b>\n"
-            "Tap\u00A0the\u00A0button\u00A0below\u00A0(<b>{artist}\u00A0—\u00A0{title}</b>):"
-        ),
-        "ready_fallback": (
-            "✅\u00A0<b>Full\u00A0MP3\u00A0is\u00A0ready!</b>\n"
-            "Tap\u00A0below\u00A0or\u00A0type\u00A0<code>@{bot_name}\u00A0{title}</code>:"
-        ),
+        "invalid_data": "❌ Invalid track data",
+        "cmd_start": "Main menu & help",
+        "cmd_top": "Top 10 global hits",
+        "cmd_fav": "Your saved Favorite tracks",
+        "cmd_lang": "Switch language (🇺🇦 / 🇬🇧)",
     },
 }
 
 
 def _get_lang(user: Optional[User]) -> str:
-    """Визначає мову користувача (з кешу налаштувань або Telegram language_code)."""
+    """Визначає мову користувача з RAM-кешу або за Telegram language_code."""
     if not user:
         return "uk"
     saved = cache.get_user_lang(user.id)
     if saved in ("uk", "en"):
         return saved
     code = (user.language_code or "").lower()
-    if code.startswith(("uk", "ru", "be")):
-        return "uk"
-    return "en"
+    if code.startswith("en"):
+        return "en"
+    return "uk"
+
+
+def _build_welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
+    """Компактне меню швидких дій та перемикання мови для /start."""
+    t = TEXTS.get(lang, TEXTS["uk"])
+    uk_label = "🇺🇦 Українська ✓" if lang == "uk" else "🇺🇦 Українська"
+    en_label = "🇬🇧 English ✓" if lang == "en" else "🇬🇧 English"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(t["btn_top"], callback_data="nav:top"),
+                InlineKeyboardButton(t["btn_favorites"], callback_data="nav:fav"),
+            ],
+            [
+                InlineKeyboardButton(uk_label, callback_data="lang:uk"),
+                InlineKeyboardButton(en_label, callback_data="lang:en"),
+            ],
+        ]
+    )
 
 
 def _build_lang_keyboard(current_lang: str) -> InlineKeyboardMarkup:
-    """Клавіатура перемикання мови (UA / EN)."""
-    uk_label = "✅ 🇺🇦 Українська" if current_lang == "uk" else "🇺🇦 Українська"
-    en_label = "✅ 🇬🇧 English" if current_lang == "en" else "🇬🇧 English"
+    """Клавіатура перемикання мови."""
+    uk_label = "🇺🇦 Українська ✓" if current_lang == "uk" else "🇺🇦 Українська"
+    en_label = "🇬🇧 English ✓" if current_lang == "en" else "🇬🇧 English"
     return InlineKeyboardMarkup(
         [
             [
@@ -236,45 +330,45 @@ def _build_lang_keyboard(current_lang: str) -> InlineKeyboardMarkup:
     )
 
 
-def _get_track_lock(deezer_id: int) -> asyncio.Lock:
-    """Повертає asyncio.Lock для конкретного deezer_id."""
-    if deezer_id not in _download_locks:
-        if len(_download_locks) > 500:
-            unlocked = [k for k, v in _download_locks.items() if not v.locked()]
-            for k in unlocked[:250]:
-                _download_locks.pop(k, None)
-        _download_locks[deezer_id] = asyncio.Lock()
-    return _download_locks[deezer_id]
+def _get_track_lock(key: str | int) -> asyncio.Lock:
+    """Повертає asyncio.Lock для конкретного ключа, уникаючи подвійного завантаження."""
+    k = str(key)
+    if k not in _download_locks:
+        if len(_download_locks) > 1000:
+            _download_locks.clear()
+        _download_locks[k] = asyncio.Lock()
+    return _download_locks[k]
 
 
 async def _resolve_track_meta(
     deezer_id: int, context: ContextTypes.DEFAULT_TYPE
 ) -> dict:
     """
-    Миттєво отримує метадані треку:
-    1) З RAM-кешу (cache.get_track_meta / bot_data)
-    2) З локальної бази SQLite
-    3) Напряму з Deezer API за deezer_id
+    Надійно знаходить метадані треку з:
+    1) RAM bot_data
+    2) SQLite / RAM кешу (cache_db)
+    3) Прямого запиту до Deezer API (якщо deezer_id > 0)
     """
-    db_meta = cache.get_track_meta(deezer_id)
-    if db_meta and db_meta.get("title") and db_meta.get("title") != "Unknown Title":
-        return db_meta
+    mem_track = context.application.bot_data.get(str(deezer_id))
+    if mem_track and mem_track.get("title") and mem_track["title"] != "Unknown Title":
+        return mem_track
 
-    deezer_key = str(deezer_id)
-    meta = context.application.bot_data.get(deezer_key)
-    if meta and meta.get("title") and meta.get("title") != "Unknown Title":
-        return meta
+    db_track = cache.get_track_meta(deezer_id)
+    if db_track and db_track.get("title") and db_track["title"] != "Unknown Title":
+        context.application.bot_data[str(deezer_id)] = db_track
+        return db_track
 
-    api_meta = await get_track_by_id(deezer_id)
-    if api_meta:
-        cache.save_track_meta(api_meta)
-        context.application.bot_data[deezer_key] = api_meta
-        return api_meta
+    if deezer_id > 0:
+        api_track = await get_track_by_id(deezer_id)
+        if api_track:
+            cache.save_track_meta(api_track)
+            context.application.bot_data[str(deezer_id)] = api_track
+            return api_track
 
     return {
         "id": deezer_id,
-        "artist": "Unknown Artist",
         "title": "Unknown Title",
+        "artist": "Unknown Artist",
         "album": "",
         "duration": 0,
         "cover_url": "",
@@ -283,14 +377,20 @@ async def _resolve_track_meta(
 
 
 def _build_full_caption(
-    artist: str, title: str, album: str = "", duration: int = 0, lang: str = "uk"
+    artist: str,
+    title: str,
+    album: str = "",
+    duration: int = 0,
+    lang: str = "uk",
+    effect_label: str = "",
 ) -> str:
-    """Формує безпечний HTML-підпис для повного MP3 треку."""
+    """Формує лаконічний та безпечний HTML-підпис для повного MP3 треку."""
     t = TEXTS.get(lang, TEXTS["uk"])
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
-    lines = [f"🎵 <b>{safe_artist} — {safe_title}</b>"]
-    if album:
+    suffix = f" <i>({html.escape(effect_label)})</i>" if effect_label else ""
+    lines = [f"🎵 <b>{safe_artist} — {safe_title}</b>{suffix}"]
+    if album and not effect_label:
         lines.append(f"💿 <b>{t['album_label']}:</b> {html.escape(album)}")
     if duration > 0:
         lines.append(f"⏱ <b>{t['duration_label']}:</b> {format_duration(duration)}")
@@ -302,9 +402,8 @@ def _build_preview_caption(
     artist: str, title: str, duration: int = 0, lang: str = "uk"
 ) -> str:
     """
-    Формує безпечний HTML-підпис для 30-секундного голосового прев'ю.
-    Використовує нерозривні пробіли (\u00A0), щоб бульбашка голосового повідомлення
-    мала таку саму ширину, як і кнопка завантаження під нею.
+    Формує безпечний HTML-підпис для 30-секундного прев'ю.
+    Використовує нерозривні пробіли (\u00A0), щоб ширина повідомлення відповідала кнопці.
     """
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
@@ -313,7 +412,7 @@ def _build_preview_caption(
     if lang == "en":
         return (
             f"🎧{nb}<b>{safe_artist}{nb}—{nb}{safe_title}</b>\n"
-            f"🎤{nb}<b>Preview:</b>{nb}30s{nb}•{nb}<b>Full\u00A0track:</b>{nb}{duration_str}\n"
+            f"🎤{nb}<b>Preview:</b>{nb}30s{nb}•{nb}<b>Full{nb}track:</b>{nb}{duration_str}\n"
             f"👇{nb}Tap{nb}below{nb}to{nb}download{nb}full{nb}MP3:"
         )
     return (
@@ -326,7 +425,7 @@ def _build_preview_caption(
 def _build_download_keyboard(
     deezer_id: int, duration: int = 0, lang: str = "uk"
 ) -> InlineKeyboardMarkup:
-    """Компактна кнопка завантаження повного MP3, вирівняна по ширині повідомлення."""
+    """Єдина чиста кнопка завантаження повного MP3 під 30-секундним прев'ю."""
     t = TEXTS.get(lang, TEXTS["uk"])
     dur_label = f" ({format_duration(duration)})" if duration > 0 else ""
     return InlineKeyboardMarkup(
@@ -341,9 +440,83 @@ def _build_download_keyboard(
     )
 
 
+def _build_track_actions_keyboard(
+    deezer_id: int,
+    user_id: Optional[int] = None,
+    lang: str = "uk",
+    is_inline: bool = False,
+    artist: str = "",
+) -> InlineKeyboardMarkup:
+    """
+    Ненав'язлива однорядкова панель під завантаженим MP3:
+    - У чаті з ботом: [ 🤍/❤️ ] [ 📜 Текст ] [ 🎛 Ефекти ] [ 📻 Схожі ]
+    - В інлайн-чаті:  [ 🤍/❤️ ] [ 📜 Текст ] [ 📻 Схожі ]
+    """
+    t = TEXTS.get(lang, TEXTS["uk"])
+    is_fav = cache.is_favorite(user_id, deezer_id) if user_id else False
+    fav_icon = "❤️" if is_fav else "🤍"
+
+    if is_inline:
+        similar_query = artist if artist and artist != "Unknown Artist" else ""
+        row = [
+            InlineKeyboardButton(fav_icon, callback_data=f"fav:{deezer_id}"),
+            InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
+            InlineKeyboardButton(
+                t["btn_similar"],
+                switch_inline_query_current_chat=similar_query,
+            ),
+        ]
+        return InlineKeyboardMarkup([row])
+
+    row = [
+        InlineKeyboardButton(fav_icon, callback_data=f"fav:{deezer_id}"),
+        InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
+        InlineKeyboardButton(t["btn_effects"], callback_data=f"fxm:{deezer_id}"),
+        InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
+    ]
+    return InlineKeyboardMarkup([row])
+
+
+def _build_effects_submenu_keyboard(
+    deezer_id: int, lang: str = "uk"
+) -> InlineKeyboardMarkup:
+    """Компактне підменю вибору аудіо-ефектів (розгортається на місці панелі дій)."""
+    t = TEXTS.get(lang, TEXTS["uk"])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🌙 Slowed", callback_data=f"fx:slowed:{deezer_id}"),
+                InlineKeyboardButton("⚡ Speed Up", callback_data=f"fx:speedup:{deezer_id}"),
+                InlineKeyboardButton("🔊 Bass", callback_data=f"fx:bass:{deezer_id}"),
+                InlineKeyboardButton(t["btn_back"], callback_data=f"fxb:{deezer_id}"),
+            ]
+        ]
+    )
+
+
+def _build_track_list_buttons(tracks: list[dict], context: ContextTypes.DEFAULT_TYPE) -> list[list[InlineKeyboardButton]]:
+    """Формує охайний список кнопок треків для результатів пошуку, чарту, вибраного або схожих."""
+    buttons = []
+    for idx, track in enumerate(tracks, start=1):
+        did = int(track["id"])
+        context.application.bot_data[str(did)] = track
+        dur_str = format_duration(track.get("duration", 0))
+        is_cached = cache.get_file_id(did) is not None
+        prefix = "⚡" if is_cached else "🎤"
+        label = f"{prefix} {track['artist']} — {track['title']} ({dur_str})"
+        if len(label) > 55:
+            label = label[:52] + "..."
+        # Якщо трек уже в кеші або має від'ємний ID (з посилання), клік одразу відкриває/надсилає MP3, інакше прев'ю
+        action = "dl" if (is_cached or did < 0) else "pv"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"{action}:{did}")]
+        )
+    return buttons
+
+
 # === Command /start ===
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Вітальне повідомлення з вибором мови або обробка deep-link (?start=track_<id>)."""
+    """Вітальне повідомлення з вибором мови або обробка deep-link (?start=track_<id> / favorites)."""
     if not update.message:
         return
 
@@ -353,14 +526,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args and len(context.args) > 0:
         arg = context.args[0]
+        if arg == "favorites":
+            await favorites_command(update, context)
+            return
         if arg.startswith("track_"):
             deezer_id_str = arg.replace("track_", "").strip()
-            if deezer_id_str.isdigit():
+            if deezer_id_str.lstrip("-").isdigit():
                 await _send_or_download_to_chat(
                     chat_id=update.effective_chat.id,
                     deezer_id=int(deezer_id_str),
                     context=context,
                     lang=lang,
+                    user_id=update.effective_user.id if update.effective_user else None,
                 )
                 return
 
@@ -368,7 +545,56 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         TEXTS[lang]["welcome"].format(bot_name=bot_name),
         parse_mode=ParseMode.HTML,
-        reply_markup=_build_lang_keyboard(lang),
+        reply_markup=_build_welcome_keyboard(lang),
+    )
+
+
+# === Command /top ===
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показує Топ-10 світових хітів Deezer."""
+    msg = update.effective_message
+    if not msg:
+        return
+    lang = _get_lang(update.effective_user)
+    t = TEXTS[lang]
+
+    tracks = await get_chart_tracks(limit=10)
+    if not tracks:
+        await msg.reply_text(t["similar_empty"], parse_mode=ParseMode.HTML)
+        return
+
+    buttons = _build_track_list_buttons(tracks, context)
+    asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, tracks)
+
+    await msg.reply_text(
+        t["top_header"],
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# === Command /favorites (/fav) ===
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показує збережені улюблені треки користувача."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    lang = _get_lang(user)
+    t = TEXTS[lang]
+    fav_tracks = cache.get_user_favorites(user.id, limit=20)
+
+    if not fav_tracks:
+        await msg.reply_text(t["fav_empty"], parse_mode=ParseMode.HTML)
+        return
+
+    buttons = _build_track_list_buttons(fav_tracks, context)
+    bot_name = html.escape(context.bot.username or "bot")
+    await msg.reply_text(
+        t["fav_header"].format(count=len(fav_tracks), bot_name=bot_name),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -383,6 +609,25 @@ async def lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=_build_lang_keyboard(lang),
     )
+
+
+# === Callback: Навігація з головного меню (nav:top / nav:fav) та закриття (delmsg) ===
+async def nav_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє кнопки Топ-чарту та Вибраного з вітального повідомлення."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    if query.data == "nav:top":
+        await top_command(update, context)
+    elif query.data == "nav:fav":
+        await favorites_command(update, context)
+    elif query.data == "delmsg" and query.message:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
 
 
 # === Callback: Перемикання мови (lang:uk / lang:en) ===
@@ -407,15 +652,142 @@ async def lang_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"{TEXTS[lang]['lang_changed']}\n\n"
                 f"{TEXTS[lang]['welcome'].format(bot_name=bot_name)}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=_build_lang_keyboard(lang),
+                reply_markup=_build_welcome_keyboard(lang),
             )
         except Exception:
             pass
 
 
-# === Пошук текстом у приватному чаті з ботом ===
+# === Обробка прямих посилань (YouTube, Shorts, TikTok, SoundCloud, Reels, Spotify) ===
+async def _handle_direct_url(
+    url: str, update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str
+):
+    """Завантажує аудіо за посиланням та надсилає MP3 з панеллю дій."""
+    msg = update.message
+    if not msg:
+        return
+    t = TEXTS[lang]
+    user_id = update.effective_user.id if update.effective_user else msg.chat_id
+
+    # 1. Якщо це посилання на трек Spotify — знаходимо трек на Deezer або за назвою
+    if is_spotify_url(url):
+        status_msg = await msg.reply_text(t["url_downloading"], parse_mode=ParseMode.HTML)
+        sp_query = await resolve_spotify_query(url)
+        if sp_query:
+            tracks = await search_tracks(sp_query, limit=1)
+            if tracks:
+                track = tracks[0]
+                cache.save_track_meta(track)
+                context.application.bot_data[str(track["id"])] = track
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await _send_or_download_to_chat(
+                    chat_id=msg.chat_id,
+                    deezer_id=int(track["id"]),
+                    context=context,
+                    lang=lang,
+                    user_id=user_id,
+                )
+                return
+        try:
+            await status_msg.edit_text(t["url_failed"], parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # 2. Детермінований від'ємний ID для кешування прямих посилань
+    synthetic_id = -int((zlib.crc32(url.strip().encode("utf-8")) & 0x7FFFFFFF) or 1)
+    cached_file_id = cache.get_file_id(synthetic_id)
+    if cached_file_id:
+        track = await _resolve_track_meta(synthetic_id, context)
+        caption = _build_full_caption(
+            track["artist"], track["title"], "", int(track.get("duration") or 0), lang=lang
+        )
+        try:
+            await context.bot.send_audio(
+                chat_id=msg.chat_id,
+                audio=cached_file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_build_track_actions_keyboard(
+                    synthetic_id, user_id=user_id, lang=lang, is_inline=False, artist=track["artist"]
+                ),
+            )
+            return
+        except Exception:
+            cache.delete_file_id(synthetic_id)
+
+    status_msg = await msg.reply_text(t["url_downloading"], parse_mode=ParseMode.HTML)
+    dl_info = await download_from_url(url)
+
+    if not dl_info or not dl_info.get("file_path"):
+        try:
+            await status_msg.edit_text(t["url_failed"], parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    file_path = dl_info["file_path"]
+    title = dl_info.get("title") or "Audio Track"
+    artist = dl_info.get("artist") or "Unknown Artist"
+    duration = int(dl_info.get("duration") or 0)
+    thumb_url = dl_info.get("thumbnail_url") or ""
+
+    track_meta = {
+        "id": synthetic_id,
+        "title": title,
+        "artist": artist,
+        "album": "",
+        "duration": duration,
+        "cover_url": thumb_url,
+        "preview_url": "",
+    }
+    cache.save_track_meta(track_meta)
+    context.application.bot_data[str(synthetic_id)] = track_meta
+
+    try:
+        thumb_bytes = await download_url_bytes(thumb_url) if thumb_url else None
+        caption = _build_full_caption(artist, title, "", duration, lang=lang)
+        keyboard = _build_track_actions_keyboard(
+            synthetic_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+        )
+        with open(file_path, "rb") as audio_f:
+            sent = await context.bot.send_audio(
+                chat_id=msg.chat_id,
+                audio=audio_f,
+                title=title,
+                performer=artist,
+                duration=duration if duration > 0 else None,
+                thumbnail=thumb_bytes,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                read_timeout=120,
+                write_timeout=120,
+            )
+            if sent and sent.audio:
+                cache.save_file_id(
+                    synthetic_id, title, artist, sent.audio.file_id, "", duration, thumb_url
+                )
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Failed sending direct URL audio: {e}")
+        try:
+            await status_msg.edit_text(t["url_failed"], parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    finally:
+        cleanup_file(file_path)
+
+
+# === Пошук текстом або за посиланням у приватному чаті з ботом ===
 async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробляє звичайні текстові повідомлення як пошуковий запит."""
+    """Обробляє прямі посилання (YouTube/TikTok/SoundCloud/Spotify) або текстовий пошук."""
     if not update.message or not update.message.text:
         return
 
@@ -426,8 +798,14 @@ async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     lang = _get_lang(update.effective_user)
     if update.effective_user and cache.get_user_lang(update.effective_user.id) is None:
         cache.set_user_lang(update.effective_user.id, lang)
-    t = TEXTS[lang]
 
+    # Перевіряємо, чи надіслано підтримуване посилання
+    direct_url = extract_supported_url(query)
+    if direct_url:
+        await _handle_direct_url(direct_url, update, context, lang)
+        return
+
+    t = TEXTS[lang]
     status_msg = await update.message.reply_text(
         t["searching"].format(query=html.escape(query)),
         parse_mode=ParseMode.HTML,
@@ -441,18 +819,7 @@ async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    buttons = []
-    for track in tracks:
-        context.application.bot_data[str(track["id"])] = track
-        dur_str = format_duration(track["duration"])
-        is_cached = cache.get_file_id(track["id"]) is not None
-        prefix = "⚡" if is_cached else "🎤"
-        label = f"{prefix} {track['artist']} — {track['title']} ({dur_str})"
-        if len(label) > 55:
-            label = label[:52] + "..."
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"pv:{track['id']}")]
-        )
+    buttons = _build_track_list_buttons(tracks, context)
 
     await status_msg.edit_text(
         t["search_results_header"].format(query=html.escape(query)),
@@ -460,7 +827,6 @@ async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-    # Зберігаємо метадані пакетно у фоні без затримки відповіді
     asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, tracks)
 
 
@@ -475,7 +841,7 @@ async def preview_callback_handler(update: Update, context: ContextTypes.DEFAULT
     t = TEXTS[lang]
 
     parts = callback_query.data.split(":")
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await callback_query.answer(t["invalid_data"], show_alert=True)
         return
 
@@ -493,11 +859,10 @@ async def preview_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     await callback_query.answer(t["preview_toast"])
 
-    # Спочатку пробуємо завантажити вже відомий preview_url (економить зайвий запит до Deezer)
     preview_url = track.get("preview_url")
     mp3_bytes = await download_url_bytes(preview_url) if preview_url else None
 
-    if not mp3_bytes:
+    if not mp3_bytes and deezer_id > 0:
         fresh_track = await get_track_by_id(deezer_id)
         if fresh_track:
             cache.save_track_meta(fresh_track)
@@ -539,65 +904,103 @@ async def preview_callback_handler(update: Update, context: ContextTypes.DEFAULT
     )
 
 
-# === Inline Query Handler (@bot назва пісні) ===
+# === Inline Query Handler (@bot назва пісні / порожній запит -> Топ-чарт / fav -> Вибране) ===
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Миттєвий обробник інлайн-пошуку (@bot_name запит)."""
+    """
+    Миттєвий обробник інлайн-пошуку (@bot_name запит):
+    - Порожній запит -> Топ-10 світових хітів Deezer (з кнопкою переходу до Вибраного, якщо є)
+    - 'fav' / '❤️' / 'вибране' -> особистий плейлист Вибраного користувача
+    - Будь-який інший текст -> пошук треків на Deezer
+    """
     if not update.inline_query:
         return
 
     query = update.inline_query.query.strip()
-    if not query or len(query) < 2:
-        return
-
-    lang = _get_lang(update.inline_query.from_user)
+    user = update.inline_query.from_user
+    lang = _get_lang(user)
     t = TEXTS[lang]
 
-    logger.info(
-        f"Inline query: '{query}' from user {update.inline_query.from_user.id} (lang={lang})"
+    is_fav_query = query.lower() in ("fav", "favorites", "❤️", "вибране", "улюблене")
+    is_chart_query = len(query) == 0
+
+    if not is_chart_query and not is_fav_query and len(query) < 2:
+        return
+
+    if is_fav_query:
+        tracks = cache.get_user_favorites(user.id, limit=15)
+    elif is_chart_query:
+        tracks = await get_chart_tracks(limit=10)
+    else:
+        logger.info(f"Inline query: '{query}' from user {user.id} (lang={lang})")
+        tracks = await search_tracks(query, limit=10)
+
+    fav_count = len(cache.get_user_favorites(user.id, limit=50))
+    inline_button = (
+        InlineQueryResultsButton(
+            text=t["fav_inline_btn"].format(count=fav_count),
+            start_parameter="favorites",
+        )
+        if fav_count > 0 and is_chart_query
+        else None
     )
 
-    tracks = await search_tracks(query, limit=10)
-
     if not tracks:
+        empty_desc = (
+            t["fav_empty"]
+            if is_fav_query
+            else t["no_results_inline_desc"].format(query=query or "Top")
+        )
         results = [
             InlineQueryResultArticle(
                 id=str(uuid4()),
                 title=t["no_results_inline_title"],
-                description=t["no_results_inline_desc"].format(query=query),
+                description=re.sub(r"<[^>]+>", "", empty_desc),
                 input_message_content=InputTextMessageContent(
-                    t["no_results_inline_msg"].format(query=html.escape(query)),
+                    t["fav_empty"]
+                    if is_fav_query
+                    else t["no_results_inline_msg"].format(query=html.escape(query)),
                     parse_mode=ParseMode.HTML,
                 ),
             )
         ]
-        await update.inline_query.answer(results, cache_time=10, is_personal=True)
+        await update.inline_query.answer(
+            results, cache_time=5, is_personal=True, button=inline_button
+        )
         return
 
     results = []
-    for track in tracks:
+    for idx, track in enumerate(tracks, start=1):
         deezer_id = int(track["id"])
         duration = int(track.get("duration") or 0)
         duration_str = format_duration(duration)
 
         context.application.bot_data[str(deezer_id)] = track
 
-        # Миттєва перевірка в RAM-кеші (0 мс затримки)
         cached_file_id = cache.get_file_id(deezer_id)
+        rank_prefix = f"🔥 #{idx} " if is_chart_query else ""
 
         if cached_file_id:
-            cached_res = InlineQueryResultCachedAudio(
-                id=str(deezer_id),
-                audio_file_id=cached_file_id,
-                caption=_build_full_caption(
-                    track["artist"],
-                    track["title"],
-                    track.get("album", ""),
-                    duration,
-                    lang=lang,
-                ),
-                parse_mode=ParseMode.HTML,
+            results.append(
+                InlineQueryResultCachedAudio(
+                    id=str(deezer_id),
+                    audio_file_id=cached_file_id,
+                    caption=_build_full_caption(
+                        track["artist"],
+                        track["title"],
+                        track.get("album", ""),
+                        duration,
+                        lang=lang,
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_build_track_actions_keyboard(
+                        deezer_id,
+                        user_id=user.id,
+                        lang=lang,
+                        is_inline=True,
+                        artist=track["artist"],
+                    ),
+                )
             )
-            results.append(cached_res)
         else:
             preview_url = track.get("preview_url") or SILENT_FALLBACK_URL
             caption = _build_preview_caption(
@@ -606,13 +1009,11 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = _build_download_keyboard(deezer_id, duration, lang=lang)
             preview_tag = "[30s Preview]" if lang == "en" else "[Прев'ю 30 сек]"
 
-            # Використовуємо InlineQueryResultAudio, щоб Telegram дозволяв замінити
-            # 30-секундне прев'ю на повний MP3 прямо в тому ж повідомленні чату (in-place)
             results.append(
                 InlineQueryResultAudio(
                     id=str(deezer_id),
                     audio_url=preview_url,
-                    title=f"🎧 {preview_tag} {track['title']} ({duration_str})",
+                    title=f"🎧 {rank_prefix}{preview_tag} {track['title']} ({duration_str})",
                     performer=track["artist"],
                     audio_duration=30,
                     caption=caption,
@@ -621,12 +1022,15 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
 
-    await update.inline_query.answer(results, cache_time=15, is_personal=True)
-
-    # Пакетне збереження метаданих у SQLite виконується у фоні ПІСЛЯ відправки відповіді
-    asyncio.get_running_loop().run_in_executor(
-        None, cache.save_tracks_meta_batch, tracks
+    cache_ttl = 5 if is_fav_query else 15
+    await update.inline_query.answer(
+        results, cache_time=cache_ttl, is_personal=True, button=inline_button
     )
+
+    if not is_fav_query:
+        asyncio.get_running_loop().run_in_executor(
+            None, cache.save_tracks_meta_batch, tracks
+        )
 
 
 # === Допоміжна функція завантаження та кешування повного MP3 ===
@@ -660,7 +1064,6 @@ async def _ensure_full_mp3_file_id(
 
         file_path = None
         try:
-            # Паралельно качаємо MP3 через yt-dlp та обкладинку з Deezer (0 мс зайвої затримки)
             if cover_url:
                 file_path, thumb_bytes = await asyncio.gather(
                     download_track(artist, title, target_duration=duration),
@@ -676,6 +1079,13 @@ async def _ensure_full_mp3_file_id(
             caption = _build_full_caption(artist, title, album, duration, lang=lang)
 
             if target_chat_id is not None:
+                keyboard = _build_track_actions_keyboard(
+                    deezer_id,
+                    user_id=user_id,
+                    lang=lang,
+                    is_inline=False,
+                    artist=artist,
+                )
                 with open(file_path, "rb") as audio_f:
                     sent = await context.bot.send_audio(
                         chat_id=target_chat_id,
@@ -686,6 +1096,7 @@ async def _ensure_full_mp3_file_id(
                         thumbnail=thumb_bytes,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
                         read_timeout=120,
                         write_timeout=120,
                     )
@@ -748,16 +1159,24 @@ async def _ensure_full_mp3_file_id(
 
 
 async def _send_or_download_to_chat(
-    chat_id: int, deezer_id: int, context: ContextTypes.DEFAULT_TYPE, lang: str = "uk"
+    chat_id: int,
+    deezer_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    lang: str = "uk",
+    user_id: Optional[int] = None,
 ):
-    """Надсилає повний MP3 у вказаний чат (з кешу або завантажує новий)."""
+    """Надсилає повний MP3 у вказаний чат (з кешу або завантажує новий) з панеллю дій."""
     t = TEXTS.get(lang, TEXTS["uk"])
+    uid = user_id or chat_id
     track = await _resolve_track_meta(deezer_id, context)
     artist = track["artist"]
     title = track["title"]
     album = track.get("album", "")
     duration = int(track.get("duration") or 0)
     caption = _build_full_caption(artist, title, album, duration, lang=lang)
+    keyboard = _build_track_actions_keyboard(
+        deezer_id, user_id=uid, lang=lang, is_inline=False, artist=artist
+    )
 
     cached_file_id = cache.get_file_id(deezer_id)
     if cached_file_id:
@@ -767,6 +1186,7 @@ async def _send_or_download_to_chat(
                 audio=cached_file_id,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
             )
             return
         except Exception as e:
@@ -784,7 +1204,7 @@ async def _send_or_download_to_chat(
     file_id, already_sent, _ = await _ensure_full_mp3_file_id(
         deezer_id=deezer_id,
         track=track,
-        user_id=chat_id,
+        user_id=uid,
         context=context,
         target_chat_id=chat_id,
         lang=lang,
@@ -809,12 +1229,13 @@ async def _send_or_download_to_chat(
             audio=file_id,
             caption=caption,
             parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
         )
 
 
 # === Callback Query Handler (Кнопка «📥 Завантажити MP3 / Download MP3») ===
 async def download_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник натискання кнопки завантаження повного MP3 під прев'ю."""
+    """Обробник натискання кнопки завантаження повного MP3."""
     callback_query = update.callback_query
     if not callback_query or not callback_query.data:
         return
@@ -823,7 +1244,7 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     t = TEXTS[lang]
 
     parts = callback_query.data.split(":")
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await callback_query.answer(t["invalid_data"], show_alert=True)
         return
 
@@ -856,20 +1277,14 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
             )
         except Exception as e:
             logger.debug(f"Could not update inline caption: {e}")
-    elif callback_query.message:
+    elif callback_query.message and (callback_query.message.voice or callback_query.message.audio):
         try:
             await callback_query.message.edit_caption(
                 caption=loading_caption,
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
-            try:
-                await callback_query.message.edit_text(
-                    text=loading_caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+            pass
 
     # Сценарій 1: Кнопку натиснуто у звичайному чаті з ботом
     if not is_inline and callback_query.message:
@@ -906,19 +1321,24 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                     duration=duration if duration > 0 else None,
                     caption=full_caption,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=_build_track_actions_keyboard(
+                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"Failed sending cached audio in chat, clearing cache: {e}")
                 cache.delete_file_id(deezer_id)
                 return
 
-        try:
-            await callback_query.message.delete()
-        except Exception:
-            pass
+        # Видаляємо попереднє голосове прев'ю (але залишаємо меню списку пошуку/чарту, якщо натиснуто звідти)
+        if callback_query.message.voice:
+            try:
+                await callback_query.message.delete()
+            except Exception:
+                pass
         return
 
-    # Сценарій 2: Кнопку натиснуто в Інлайн-повідомленні
+    # Сценарій 2: Кнопку натиснуто в Інлайн-повідомленні (@bot у будь-якому чаті)
     file_id, _, needs_bot_start = await _ensure_full_mp3_file_id(
         deezer_id=deezer_id,
         track=track,
@@ -959,6 +1379,10 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                 logger.debug(f"Could not set inline error caption: {e}")
         return
 
+    inline_actions_kb = _build_track_actions_keyboard(
+        deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
+    )
+
     try:
         await context.bot.edit_message_media(
             inline_message_id=callback_query.inline_message_id,
@@ -970,40 +1394,358 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                 caption=full_caption,
                 parse_mode=ParseMode.HTML,
             ),
+            reply_markup=inline_actions_kb,
         )
-    except BadRequest as e:
-        logger.warning(f"Inline voice->audio edit fallback triggered: {e}")
-        try:
-            await context.bot.send_audio(
-                chat_id=user_id,
-                audio=file_id,
-                caption=full_caption,
-                parse_mode=ParseMode.HTML,
-            )
-        except Forbidden:
-            pass
+    except TelegramError as e:
+        logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
 
-        bot_username = context.bot.username or (await context.bot.get_me()).username
-        deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
+
+# === Callback: Додавання / видалення з Вибраного (fav:<deezer_id>) ===
+async def favorite_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Додає або видаляє трек із Вибраного користувача в один клік."""
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+
+    lang = _get_lang(query.from_user)
+    t = TEXTS[lang]
+    parts = query.data.split(":")
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await query.answer(t["invalid_data"])
+        return
+
+    deezer_id = int(parts[1])
+    user_id = query.from_user.id
+    track = await _resolve_track_meta(deezer_id, context)
+    cache.save_track_meta(track)
+
+    added = cache.toggle_favorite(user_id, deezer_id)
+    await query.answer(t["fav_added_toast"] if added else t["fav_removed_toast"])
+
+    is_inline = query.inline_message_id is not None
+    new_kb = _build_track_actions_keyboard(
+        deezer_id,
+        user_id=user_id,
+        lang=lang,
+        is_inline=is_inline,
+        artist=track.get("artist", ""),
+    )
+    try:
+        if is_inline:
+            await context.bot.edit_message_reply_markup(
+                inline_message_id=query.inline_message_id,
+                reply_markup=new_kb,
+            )
+        elif query.message:
+            await query.message.edit_reply_markup(reply_markup=new_kb)
+    except Exception:
+        pass
+
+
+# === Callback: Текст пісні (lyr:<deezer_id> та lyrc:<deezer_id>) ===
+async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показує текст пісні в згортаному блоці (<blockquote expandable>) без засмічення чату."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    lang = _get_lang(query.from_user)
+    t = TEXTS[lang]
+    parts = query.data.split(":")
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await query.answer(t["invalid_data"])
+        return
+
+    action = parts[0]
+    deezer_id = int(parts[1])
+    user_id = query.from_user.id if query.from_user else 0
+    is_inline = query.inline_message_id is not None
+    track = await _resolve_track_meta(deezer_id, context)
+    artist = track["artist"]
+    title = track["title"]
+    album = track.get("album", "")
+    duration = int(track.get("duration") or 0)
+
+    # Згортання тексту назад в інлайн-повідомленні
+    if action == "lyrc" and is_inline:
+        await query.answer()
         try:
             await context.bot.edit_message_caption(
-                inline_message_id=callback_query.inline_message_id,
-                caption=(
-                    f"{full_caption}\n\n"
-                    + t["ready_fallback"].format(
-                        bot_name=html.escape(bot_username),
-                        title=html.escape(title),
-                    )
-                ),
+                inline_message_id=query.inline_message_id,
+                caption=_build_full_caption(artist, title, album, duration, lang=lang),
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
+                reply_markup=_build_track_actions_keyboard(
+                    deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
                 ),
             )
         except Exception:
             pass
-    except TelegramError as e:
-        logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
+        return
+
+    await query.answer(t["lyrics_loading_toast"])
+    lyrics = await get_track_lyrics(artist, title)
+
+    if not lyrics:
+        not_found_msg = t["lyrics_not_found"].format(
+            artist=html.escape(artist), title=html.escape(title)
+        )
+        if not is_inline and query.message:
+            await query.message.reply_text(
+                not_found_msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(t["btn_close"], callback_data="delmsg")]]
+                ),
+            )
+        else:
+            await query.answer(re.sub(r"<[^>]+>", "", not_found_msg), show_alert=True)
+        return
+
+    if is_inline:
+        # В інлайн-повідомленні поміщаємо текст у згортаний блок у підписі (ліміт caption — 1024 символи)
+        header = f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
+        max_len = 940 - len(header)
+        trimmed = lyrics[:max_len] + ("..." if len(lyrics) > max_len else "")
+        inline_caption = f"{header}<blockquote expandable>{html.escape(trimmed)}</blockquote>"
+        try:
+            await context.bot.edit_message_caption(
+                inline_message_id=query.inline_message_id,
+                caption=inline_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                t["btn_hide_lyrics"], callback_data=f"lyrc:{deezer_id}"
+                            )
+                        ]
+                    ]
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"Could not show inline lyrics: {e}")
+        return
+
+    # У звичайному чаті надсилаємо згортану картку з кнопкою «Закрити»
+    header = t["lyrics_header"].format(
+        artist=html.escape(artist), title=html.escape(title)
+    )
+    trimmed = lyrics[:3700] + ("\n..." if len(lyrics) > 3700 else "")
+    text_body = f"{header}\n\n<blockquote expandable>{html.escape(trimmed)}</blockquote>"
+    if query.message:
+        await query.message.reply_text(
+            text_body,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(t["btn_close"], callback_data="delmsg")]]
+            ),
+        )
+
+
+# === Callback: Схожі треки (sim:<deezer_id>) ===
+async def similar_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показує добірку схожих треків та топ-хітів виконавця."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    lang = _get_lang(query.from_user)
+    t = TEXTS[lang]
+    parts = query.data.split(":")
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await query.answer(t["invalid_data"])
+        return
+
+    deezer_id = int(parts[1])
+    await query.answer()
+
+    track = await _resolve_track_meta(deezer_id, context)
+    artist = track["artist"]
+    title = track["title"]
+
+    similar = await get_similar_tracks(deezer_id, artist=artist, title=title, limit=6)
+    if not similar:
+        if query.message:
+            await query.message.reply_text(t["similar_empty"], parse_mode=ParseMode.HTML)
+        return
+
+    buttons = _build_track_list_buttons(similar, context)
+    buttons.append([InlineKeyboardButton(t["btn_close"], callback_data="delmsg")])
+    asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, similar)
+
+    if query.message:
+        await query.message.reply_text(
+            t["similar_header"].format(artist=html.escape(artist)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+
+# === Callback: Аудіо-ефекти (fxm:<id>, fxb:<id>, fx:<effect>:<id>) ===
+async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обробляє меню ефектів (Slowed + Reverb, Speed Up, Bass Boost):
+    - fxm:<id> — розгортає підменю ефектів
+    - fxb:<id> — повертає основну панель дій
+    - fx:<effect>:<id> — генерує та надсилає трек з обраним ефектом
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    lang = _get_lang(query.from_user)
+    t = TEXTS[lang]
+    user_id = query.from_user.id if query.from_user else 0
+    parts = query.data.split(":")
+
+    if parts[0] == "fxm" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        deezer_id = int(parts[1])
+        await query.answer()
+        if query.message:
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=_build_effects_submenu_keyboard(deezer_id, lang=lang)
+                )
+            except Exception:
+                pass
+        return
+
+    if parts[0] == "fxb" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        deezer_id = int(parts[1])
+        track = await _resolve_track_meta(deezer_id, context)
+        await query.answer()
+        if query.message:
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=_build_track_actions_keyboard(
+                        deezer_id,
+                        user_id=user_id,
+                        lang=lang,
+                        is_inline=False,
+                        artist=track.get("artist", ""),
+                    )
+                )
+            except Exception:
+                pass
+        return
+
+    if parts[0] == "fx" and len(parts) >= 3 and parts[2].lstrip("-").isdigit():
+        effect = parts[1]
+        deezer_id = int(parts[2])
+        effect_label = EFFECT_LABELS.get(lang, EFFECT_LABELS["uk"]).get(effect, effect)
+        await query.answer(t["effect_loading_toast"].format(effect=effect_label))
+
+        chat_id = query.message.chat_id if query.message else user_id
+        track = await _resolve_track_meta(deezer_id, context)
+        artist = track["artist"]
+        title = track["title"]
+        duration = int(track.get("duration") or 0)
+
+        # Повертаємо основний ряд кнопок на оригінальному треку
+        if query.message:
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=_build_track_actions_keyboard(
+                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                    )
+                )
+            except Exception:
+                pass
+
+        # 1. Миттєва перевірка кешу ефекту
+        cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
+        if cached_fx_id:
+            try:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=cached_fx_id,
+                    caption=_build_full_caption(
+                        artist, title, "", 0, lang=lang, effect_label=effect_label
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            except Exception:
+                pass
+
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=t["effect_processing"].format(
+                effect=html.escape(effect_label),
+                artist=html.escape(artist),
+                title=html.escape(title),
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+        lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
+        async with lock:
+            base_path = None
+            fx_path = None
+            temp_dl_dir = None
+            try:
+                # Спочатку пробуємо швидко завантажити базовий MP3 із Telegram file_id (до 20 МБ)
+                base_file_id = cache.get_file_id(deezer_id)
+                if base_file_id:
+                    try:
+                        tg_file = await context.bot.get_file(base_file_id)
+                        temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
+                        candidate_path = os.path.join(temp_dl_dir, "base.mp3")
+                        await tg_file.download_to_drive(custom_path=candidate_path)
+                        if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
+                            base_path = candidate_path
+                    except Exception as e:
+                        logger.debug(f"Could not fetch base file from Telegram, re-downloading: {e}")
+
+                if not base_path:
+                    base_path = await download_track(artist, title, target_duration=duration)
+
+                if not base_path or not os.path.exists(base_path):
+                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                    return
+
+                fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
+                if not fx_res:
+                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                    return
+
+                fx_path, new_duration = fx_res
+                fx_title = f"{title} ({effect_label})"
+                caption = _build_full_caption(
+                    artist, title, "", new_duration, lang=lang, effect_label=effect_label
+                )
+                with open(fx_path, "rb") as audio_f:
+                    sent = await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_f,
+                        title=fx_title,
+                        performer=artist,
+                        duration=new_duration if new_duration > 0 else None,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        read_timeout=120,
+                        write_timeout=120,
+                    )
+                    if sent and sent.audio:
+                        cache.save_effect_file_id(deezer_id, effect, sent.audio.file_id)
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error(f"Error creating audio effect {effect}: {e}")
+                try:
+                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            finally:
+                if base_path:
+                    cleanup_file(base_path)
+                if fx_path:
+                    cleanup_file(fx_path)
+                if temp_dl_dir and os.path.exists(temp_dl_dir):
+                    cleanup_file(os.path.join(temp_dl_dir, "base.mp3"))
 
 
 # === Global Error Handler ===
@@ -1012,8 +1754,28 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
-    """Прогріває HTTP-пул до Deezer при запуску бота для миттєвого першого пошуку."""
+    """Прогріває HTTP-пул до Deezer та реєструє меню команд бота."""
     await warmup_session()
+    try:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", TEXTS["uk"]["cmd_start"]),
+                BotCommand("top", TEXTS["uk"]["cmd_top"]),
+                BotCommand("favorites", TEXTS["uk"]["cmd_fav"]),
+                BotCommand("lang", TEXTS["uk"]["cmd_lang"]),
+            ]
+        )
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", TEXTS["en"]["cmd_start"]),
+                BotCommand("top", TEXTS["en"]["cmd_top"]),
+                BotCommand("favorites", TEXTS["en"]["cmd_fav"]),
+                BotCommand("lang", TEXTS["en"]["cmd_lang"]),
+            ],
+            language_code="en",
+        )
+    except Exception as e:
+        logger.debug(f"Could not set bot commands: {e}")
 
 
 async def post_shutdown(application: Application):
@@ -1039,11 +1801,18 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("top", top_command))
+    app.add_handler(CommandHandler(["favorites", "fav"], favorites_command))
     app.add_handler(CommandHandler("lang", lang_command))
     app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_handler(CallbackQueryHandler(nav_callback_handler, pattern=r"^(nav:|delmsg$)"))
     app.add_handler(CallbackQueryHandler(lang_callback_handler, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(preview_callback_handler, pattern=r"^pv:"))
     app.add_handler(CallbackQueryHandler(download_callback_handler, pattern=r"^dl:"))
+    app.add_handler(CallbackQueryHandler(favorite_callback_handler, pattern=r"^fav:"))
+    app.add_handler(CallbackQueryHandler(lyrics_callback_handler, pattern=r"^lyr[c]?:"))
+    app.add_handler(CallbackQueryHandler(similar_callback_handler, pattern=r"^sim:"))
+    app.add_handler(CallbackQueryHandler(effects_callback_handler, pattern=r"^fx[mb]?:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_search_handler)
     )
