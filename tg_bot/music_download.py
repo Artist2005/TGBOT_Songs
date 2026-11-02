@@ -1,7 +1,6 @@
 """
-Модуль швидкого завантаження треків через yt-dlp та роботи з FFmpeg.
-Оптимізований для максимальної швидкості пошуку на YouTube, багатопотокового
-завантаження фрагментів та конвертації в MP3.
+Модуль надійного та швидкого завантаження треків через yt-dlp (YouTube + SoundCloud fallback)
+та прямої конвертації через FFmpeg (без потреби у ffprobe).
 """
 
 import os
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 TEMP_PREFIX = "tgbot_dl_"
 YTDLP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tgbot_ytdlp_cache")
 
-# Окремий пул потоків для завантажень та FFmpeg, щоб не блокувати основний цикл
 _executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="music_dl")
 
 
@@ -50,9 +48,11 @@ FFMPEG_PATH = _resolve_ffmpeg_path()
 
 
 def _make_match_filter(target_duration: int = 0):
-    """Створює фільтр для відсіювання стрімів, Shorts та багатогодинних міксів."""
+    """
+    Створює фільтр для відсіювання стрімів, 30-секундних Go+ прев'ю та багатогодинних міксів.
+    """
     max_duration = max(int(target_duration * 2.5), 900) if target_duration > 0 else 900
-    min_duration = 25 if (target_duration == 0 or target_duration >= 40) else 10
+    min_duration = 45 if (target_duration == 0 or target_duration >= 50) else 15
 
     def _filter(info_dict, *, incomplete: bool = False):
         if info_dict.get("is_live"):
@@ -63,85 +63,161 @@ def _make_match_filter(target_duration: int = 0):
                 return f"Track is too long ({duration}s > {max_duration}s)"
             if duration < min_duration:
                 return f"Track is too short ({duration}s < {min_duration}s)"
+
+        # Відсіюємо 30-секундні прев'ю SoundCloud Go+
+        formats = info_dict.get("formats") or []
+        if formats and all(
+            str(f.get("format_id", "")).endswith("_preview") for f in formats
+        ):
+            return "Skipping preview-only track"
         return None
 
     return _filter
 
 
+def _convert_to_mp3_ffmpeg(input_path: str, output_mp3_path: str) -> bool:
+    """
+    Конвертує завантажений аудіофайл (.m4a/.webm/.opus) у MP3 192 kbps напряму через FFmpeg
+    (не потребує наявності ffprobe на сервері).
+    """
+    if input_path.lower().endswith(".mp3") and os.path.exists(input_path) and os.path.getsize(input_path) > 100_000:
+        if input_path != output_mp3_path:
+            shutil.move(input_path, output_mp3_path)
+        return True
+
+    ffmpeg_bin = FFMPEG_PATH or "ffmpeg"
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                "0",
+                "-y",
+                "-i",
+                input_path,
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                output_mp3_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode == 0 and os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 0:
+            try:
+                if os.path.exists(input_path) and input_path != output_mp3_path:
+                    os.remove(input_path)
+            except Exception:
+                pass
+            return True
+
+        logger.warning(
+            f"FFmpeg MP3 conversion failed (code {proc.returncode}): "
+            f"{proc.stderr.decode('utf-8', errors='ignore')}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"FFmpeg conversion exception: {e}")
+        return False
+
+
 def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> Optional[str]:
-    """Синхронна функція швидкого завантаження через yt-dlp."""
-    output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
+    """
+    Синхронна функція завантаження:
+    1) Спочатку шукає на YouTube (з обходом блокування датацентрів GCP через мобільні клієнти).
+    2) Якщо YouTube блокує IP віртуалки — миттєво завантажує повний трек із SoundCloud (scsearch5).
+    3) Конвертує у MP3 напряму через FFmpeg (без ffprobe).
+    """
+    output_template = os.path.join(output_dir, "raw_%(id)s.%(ext)s")
 
-    ydl_opts = {
-        # Обираємо легкий аудіопотік (m4a/webm до 192k), який качається в рази швидше за відео
-        "format": "bestaudio[ext=m4a][abr<=192]/bestaudio[ext=webm][abr<=192]/bestaudio/best",
-        "outtmpl": output_template,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            },
-        ],
-        "postprocessor_args": {
-            "extractaudio": ["-threads", "0"],
-        },
-        "concurrent_fragment_downloads": 4,
-        "cachedir": YTDLP_CACHE_DIR,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "lazy_playlist": True,
-        "default_search": "ytsearch1",
-        "max_filesize": 48 * 1024 * 1024,  # Ліміт Telegram Bot API (50 MB)
-        "match_filter": _make_match_filter(target_duration),
-        "socket_timeout": 10,
-        "retries": 2,
-        "fragment_retries": 2,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
-    }
-
-    if FFMPEG_PATH:
-        ydl_opts["ffmpeg_location"] = FFMPEG_PATH
-
-    search_variants = [
-        f"ytsearch1:{query} official audio",
-        f"ytsearch1:{query}",
+    attempts = [
+        (
+            f"scsearch5:{query}",
+            {},
+        ),
+        (
+            f"ytsearch1:{query} official audio",
+            {"youtube": {"player_client": ["ios", "android", "mweb"]}},
+        ),
+        (
+            f"ytsearch1:{query}",
+            {"youtube": {"player_client": ["android", "tv", "ios"]}},
+        ),
     ]
 
-    for search_query in search_variants:
+    for search_query, extractor_args in attempts:
+        # Очищуємо тимчасову папку перед спробою
+        for old_f in os.listdir(output_dir):
+            try:
+                os.remove(os.path.join(output_dir, old_f))
+            except Exception:
+                pass
+
+        ydl_opts = {
+            "format": "http_mp3_128/hls_mp3_128/bestaudio[ext=mp3]/bestaudio[ext=m4a][abr<=192]/bestaudio[ext=webm][abr<=192]/bestaudio/best",
+            "outtmpl": output_template,
+            "concurrent_fragment_downloads": 8,
+            "cachedir": YTDLP_CACHE_DIR,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "lazy_playlist": True,
+            "max_downloads": 1,
+            "max_filesize": 48 * 1024 * 1024,
+            "match_filter": _make_match_filter(target_duration),
+            "socket_timeout": 12,
+            "retries": 2,
+            "fragment_retries": 2,
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        }
+
+        if extractor_args:
+            ydl_opts["extractor_args"] = extractor_args
+        if FFMPEG_PATH:
+            ydl_opts["ffmpeg_location"] = FFMPEG_PATH
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(search_query, download=True)
-                if not info:
-                    continue
-                if "entries" in info:
-                    entries = [e for e in (info["entries"] or []) if e]
-                    if not entries:
-                        continue
-                    info = entries[0]
-
-                filename = ydl.prepare_filename(info)
-                base, _ = os.path.splitext(filename)
-                mp3_filename = f"{base}.mp3"
-
-                if os.path.exists(mp3_filename) and os.path.getsize(mp3_filename) > 0:
-                    return mp3_filename
-                if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                    return filename
-
-                for f in os.listdir(output_dir):
-                    full_p = os.path.join(output_dir, f)
-                    if f.endswith(".mp3") and os.path.getsize(full_p) > 0:
-                        return full_p
+                try:
+                    ydl.extract_info(search_query, download=True)
+                except yt_dlp.utils.MaxDownloadsReached:
+                    # Нормальне завершення при знаходженні першого валідного треку у scsearch5
+                    pass
 
         except Exception as e:
-            logger.warning(f"yt-dlp attempt failed for '{search_query}': {e}")
+            logger.warning(f"Download attempt failed for '{search_query}': {e}")
+
+        # Перевіряємо, чи з'явився завантажений аудіофайл у папці
+        downloaded_files = [
+            os.path.join(output_dir, f)
+            for f in os.listdir(output_dir)
+            if not f.endswith(".part") and not f.endswith(".ytdl")
+        ]
+        downloaded_files = [
+            p for p in downloaded_files if os.path.isfile(p) and os.path.getsize(p) > 50_000
+        ]
+
+        if downloaded_files:
+            raw_path = downloaded_files[0]
+            final_mp3 = os.path.join(output_dir, "track.mp3")
+            if _convert_to_mp3_ffmpeg(raw_path, final_mp3):
+                logger.info(f"Successfully downloaded & converted via '{search_query}'")
+                return final_mp3
+            # Якщо FFmpeg не зміг сконвертувати, повертаємо оригінальний аудіофайл (.m4a)
+            logger.info(f"Returning raw audio file via '{search_query}': {raw_path}")
+            return raw_path
 
     return None
 

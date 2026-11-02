@@ -649,20 +649,20 @@ async def _ensure_full_mp3_file_id(
     context: ContextTypes.DEFAULT_TYPE,
     target_chat_id: Optional[int] = None,
     lang: str = "uk",
-) -> tuple[Optional[str], bool]:
+) -> tuple[Optional[str], bool, bool]:
     """
-    Повертає (file_id, already_sent_to_target_chat).
+    Повертає (file_id, already_sent_to_target_chat, needs_bot_start).
     Використовує лок на deezer_id та паралельно завантажує MP3 і обкладинку альбому.
     """
     cached_id = cache.get_file_id(deezer_id)
     if cached_id:
-        return cached_id, False
+        return cached_id, False, False
 
     lock = _get_track_lock(deezer_id)
     async with lock:
         cached_id = cache.get_file_id(deezer_id)
         if cached_id:
-            return cached_id, False
+            return cached_id, False, False
 
         artist = track["artist"]
         title = track["title"]
@@ -683,7 +683,7 @@ async def _ensure_full_mp3_file_id(
                 thumb_bytes = None
 
             if not file_path or not os.path.exists(file_path):
-                return None, False
+                return None, False, False
 
             caption = _build_full_caption(artist, title, album, duration, lang=lang)
 
@@ -706,7 +706,7 @@ async def _ensure_full_mp3_file_id(
                         cache.save_file_id(
                             deezer_id, title, artist, file_id, album, duration, cover_url
                         )
-                        return file_id, True
+                        return file_id, True, False
 
             upload_chats = []
             if STORAGE_CHAT_ID:
@@ -716,6 +716,7 @@ async def _ensure_full_mp3_file_id(
                     upload_chats.append((STORAGE_CHAT_ID, False))
             upload_chats.append((user_id, True))
 
+            needs_start = False
             for chat_dest, delete_after in upload_chats:
                 try:
                     with open(file_path, "rb") as audio_f:
@@ -742,11 +743,13 @@ async def _ensure_full_mp3_file_id(
                                     await sent.delete()
                                 except Exception as del_err:
                                     logger.debug(f"Could not delete temp DM msg: {del_err}")
-                            return file_id, False
+                            return file_id, False, False
+                except Forbidden:
+                    needs_start = True
                 except Exception as upload_err:
                     logger.warning(f"Upload to {chat_dest} failed: {upload_err}")
 
-            return None, False
+            return None, False, needs_start
 
         finally:
             if file_path:
@@ -787,7 +790,7 @@ async def _send_or_download_to_chat(
         parse_mode=ParseMode.HTML,
     )
 
-    file_id, already_sent = await _ensure_full_mp3_file_id(
+    file_id, already_sent, _ = await _ensure_full_mp3_file_id(
         deezer_id=deezer_id,
         track=track,
         user_id=chat_id,
@@ -880,7 +883,7 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     # Сценарій 1: Кнопку натиснуто у звичайному чаті з ботом
     if not is_inline and callback_query.message:
         chat_id = callback_query.message.chat_id
-        file_id, already_sent = await _ensure_full_mp3_file_id(
+        file_id, already_sent, _ = await _ensure_full_mp3_file_id(
             deezer_id=deezer_id,
             track=track,
             user_id=user_id,
@@ -925,7 +928,7 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Сценарій 2: Кнопку натиснуто в Інлайн-повідомленні
-    file_id, _ = await _ensure_full_mp3_file_id(
+    file_id, _, needs_bot_start = await _ensure_full_mp3_file_id(
         deezer_id=deezer_id,
         track=track,
         user_id=user_id,
@@ -935,21 +938,34 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     )
 
     if not file_id:
-        bot_username = context.bot.username or (await context.bot.get_me()).username
-        deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
-        try:
-            await context.bot.edit_message_caption(
-                inline_message_id=callback_query.inline_message_id,
-                caption=t["deep_link_prompt"].format(
-                    artist=html.escape(artist), title=html.escape(title)
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
-                ),
-            )
-        except Exception as e:
-            logger.debug(f"Could not set fallback deep-link caption: {e}")
+        if needs_bot_start:
+            bot_username = context.bot.username or (await context.bot.get_me()).username
+            deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=callback_query.inline_message_id,
+                    caption=t["deep_link_prompt"].format(
+                        artist=html.escape(artist), title=html.escape(title)
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
+                    ),
+                )
+            except Exception as e:
+                logger.debug(f"Could not set fallback deep-link caption: {e}")
+        else:
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=callback_query.inline_message_id,
+                    caption=t["download_failed"].format(
+                        artist=html.escape(artist), title=html.escape(title)
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_build_download_keyboard(deezer_id, duration, lang=lang),
+                )
+            except Exception as e:
+                logger.debug(f"Could not set inline error caption: {e}")
         return
 
     try:

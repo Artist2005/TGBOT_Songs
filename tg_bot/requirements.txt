@@ -1,5 +1,5 @@
 python-telegram-bot==21.*
-yt-dlp
+yt-dlp>=2026.10.0
 aiohttp
 aiofiles
 python-dotenv
