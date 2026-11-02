@@ -192,11 +192,13 @@ TEXTS = {
         "btn_open_download": "📥 Відкрити бота і забрати MP3",
         "btn_top": "🔥 Топ-чарт",
         "btn_favorites": "❤️ Вибране",
+        "btn_fav_add": "🤍 У вибране",
+        "btn_fav_saved": "❤️ У вибраному",
         "btn_lyrics": "📜 Текст",
         "btn_hide_lyrics": "🔙 Сховати текст",
         "btn_effects": "🎛 Ефекти",
         "btn_similar": "📻 Схожі",
-        "btn_back": "🔙",
+        "btn_back": "🔙 Назад",
         "btn_close": "✖️ Закрити",
         "album_label": "Альбом",
         "duration_label": "Тривалість",
@@ -280,11 +282,13 @@ TEXTS = {
         "btn_open_download": "📥 Open Bot & Get MP3",
         "btn_top": "🔥 Top Chart",
         "btn_favorites": "❤️ Favorites",
+        "btn_fav_add": "🤍 Favorite",
+        "btn_fav_saved": "❤️ Saved",
         "btn_lyrics": "📜 Lyrics",
         "btn_hide_lyrics": "🔙 Hide Lyrics",
         "btn_effects": "🎛 Effects",
         "btn_similar": "📻 Similar",
-        "btn_back": "🔙",
+        "btn_back": "🔙 Back",
         "btn_close": "✖️ Close",
         "album_label": "Album",
         "duration_label": "Duration",
@@ -462,48 +466,64 @@ def _build_track_actions_keyboard(
     artist: str = "",
 ) -> InlineKeyboardMarkup:
     """
-    Ненав'язлива однорядкова панель під завантаженим MP3:
-    - У чаті з ботом: [ 🤍/❤️ ] [ 📜 Текст ] [ 🎛 Ефекти ] [ 📻 Схожі ]
-    - В інлайн-чаті:  [ 🤍/❤️ ] [ 📜 Текст ] [ 📻 Схожі ]
+    Дворядкова панель дій під завантаженим MP3:
+    - У чаті з ботом (2x2):
+        [ 🤍 У вибране / ❤️ У вибраному ]  [ 📜 Текст ]
+        [ 🎛 Ефекти ]                      [ 📻 Схожі ]
+    - В інлайн-чаті (2 ряди):
+        [ 🤍 У вибране / ❤️ У вибраному ]  [ 📜 Текст ]
+        [ 📻 Схожі ]
     """
     t = TEXTS.get(lang, TEXTS["uk"])
     is_fav = cache.is_favorite(user_id, deezer_id) if user_id else False
-    fav_icon = "❤️" if is_fav else "🤍"
+    fav_label = t["btn_fav_saved"] if is_fav else t["btn_fav_add"]
 
     if is_inline:
         similar_query = artist if artist and artist != "Unknown Artist" else ""
-        row = [
-            InlineKeyboardButton(fav_icon, callback_data=f"fav:{deezer_id}"),
-            InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
-            InlineKeyboardButton(
-                t["btn_similar"],
-                switch_inline_query_current_chat=similar_query,
-            ),
-        ]
-        return InlineKeyboardMarkup([row])
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(fav_label, callback_data=f"fav:{deezer_id}"),
+                    InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        t["btn_similar"],
+                        switch_inline_query_current_chat=similar_query,
+                    ),
+                ],
+            ]
+        )
 
-    row = [
-        InlineKeyboardButton(fav_icon, callback_data=f"fav:{deezer_id}"),
-        InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
-        InlineKeyboardButton(t["btn_effects"], callback_data=f"fxm:{deezer_id}"),
-        InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
-    ]
-    return InlineKeyboardMarkup([row])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(fav_label, callback_data=f"fav:{deezer_id}"),
+                InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
+            ],
+            [
+                InlineKeyboardButton(t["btn_effects"], callback_data=f"fxm:{deezer_id}"),
+                InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
+            ],
+        ]
+    )
 
 
 def _build_effects_submenu_keyboard(
     deezer_id: int, lang: str = "uk"
 ) -> InlineKeyboardMarkup:
-    """Компактне підменю вибору аудіо-ефектів (розгортається на місці панелі дій)."""
+    """Дворядкове підменю вибору аудіо-ефектів (2x2)."""
     t = TEXTS.get(lang, TEXTS["uk"])
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🌙 Slowed", callback_data=f"fx:slowed:{deezer_id}"),
+                InlineKeyboardButton("🌙 Slowed + Reverb", callback_data=f"fx:slowed:{deezer_id}"),
                 InlineKeyboardButton("⚡ Speed Up", callback_data=f"fx:speedup:{deezer_id}"),
-                InlineKeyboardButton("🔊 Bass", callback_data=f"fx:bass:{deezer_id}"),
+            ],
+            [
+                InlineKeyboardButton("🔊 Bass Boost", callback_data=f"fx:bass:{deezer_id}"),
                 InlineKeyboardButton(t["btn_back"], callback_data=f"fxb:{deezer_id}"),
-            ]
+            ],
         ]
     )
 
