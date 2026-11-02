@@ -189,6 +189,7 @@ TEXTS = {
             "📩 Трек надіслано вам у @{bot_name} (або натисніть кнопку нижче, щоб забрати його):"
         ),
         "btn_download": "📥 Завантажити MP3{dur}",
+        "btn_original": "💿 Оригінал{dur}",
         "btn_open_download": "📥 Відкрити бота і забрати MP3",
         "btn_top": "🔥 Топ-чарт",
         "btn_favorites": "❤️ Вибране",
@@ -279,6 +280,7 @@ TEXTS = {
             "📩 Sent to your DM in @{bot_name} (or tap below to get it):"
         ),
         "btn_download": "📥 Download MP3{dur}",
+        "btn_original": "💿 Original{dur}",
         "btn_open_download": "📥 Open Bot & Get MP3",
         "btn_top": "🔥 Top Chart",
         "btn_favorites": "❤️ Favorites",
@@ -464,56 +466,83 @@ def _build_track_actions_keyboard(
     lang: str = "uk",
     is_inline: bool = False,
     artist: str = "",
+    include_download: bool = False,
+    show_original_btn: bool = False,
+    duration: int = 0,
 ) -> InlineKeyboardMarkup:
     """
-    Дворядкова панель дій під завантаженим MP3:
-    - У чаті з ботом (2x2):
+    Дворядкова панель дій (2×2) під треком (і в чаті з ботом, і через @ім'я_бота):
         [ 🤍 У вибране / ❤️ У вибраному ]  [ 📜 Текст ]
         [ 🎛 Ефекти ]                      [ 📻 Схожі ]
-    - В інлайн-чаті (2 ряди):
-        [ 🤍 У вибране / ❤️ У вибраному ]  [ 📜 Текст ]
-        [ 📻 Схожі ]
+    Якщо це ще 30-секундне прев'ю (include_download=True), зверху додається кнопка завантаження MP3.
+    Якщо в інлайн-режимі застосовано аудіо-ефект (show_original_btn=True), зверху є кнопка повернення до оригіналу.
     """
     t = TEXTS.get(lang, TEXTS["uk"])
     is_fav = cache.is_favorite(user_id, deezer_id) if user_id else False
     fav_label = t["btn_fav_saved"] if is_fav else t["btn_fav_add"]
 
-    if is_inline:
-        similar_query = artist if artist and artist != "Unknown Artist" else ""
-        return InlineKeyboardMarkup(
+    suffix = "p" if include_download else ""
+    fav_cb = f"fav{suffix}:{deezer_id}"
+    lyr_cb = f"lyr{suffix}:{deezer_id}"
+    fxm_cb = f"fxm{suffix}:{deezer_id}"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    dur_label = f" ({format_duration(duration)})" if duration > 0 else ""
+
+    if include_download:
+        rows.append(
             [
-                [
-                    InlineKeyboardButton(fav_label, callback_data=f"fav:{deezer_id}"),
-                    InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
-                ],
-                [
-                    InlineKeyboardButton(
-                        t["btn_similar"],
-                        switch_inline_query_current_chat=similar_query,
-                    ),
-                ],
+                InlineKeyboardButton(
+                    t["btn_download"].format(dur=dur_label),
+                    callback_data=f"dl:{deezer_id}",
+                )
+            ]
+        )
+    elif show_original_btn:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    t["btn_original"].format(dur=dur_label),
+                    callback_data=f"dl:{deezer_id}",
+                )
             ]
         )
 
-    return InlineKeyboardMarkup(
+    rows.append(
         [
-            [
-                InlineKeyboardButton(fav_label, callback_data=f"fav:{deezer_id}"),
-                InlineKeyboardButton(t["btn_lyrics"], callback_data=f"lyr:{deezer_id}"),
-            ],
-            [
-                InlineKeyboardButton(t["btn_effects"], callback_data=f"fxm:{deezer_id}"),
-                InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
-            ],
+            InlineKeyboardButton(fav_label, callback_data=fav_cb),
+            InlineKeyboardButton(t["btn_lyrics"], callback_data=lyr_cb),
         ]
     )
 
+    if is_inline:
+        similar_query = artist if artist and artist != "Unknown Artist" else ""
+        rows.append(
+            [
+                InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
+                InlineKeyboardButton(
+                    t["btn_similar"],
+                    switch_inline_query_current_chat=similar_query,
+                ),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(t["btn_effects"], callback_data=fxm_cb),
+                InlineKeyboardButton(t["btn_similar"], callback_data=f"sim:{deezer_id}"),
+            ]
+        )
+
+    return InlineKeyboardMarkup(rows)
+
 
 def _build_effects_submenu_keyboard(
-    deezer_id: int, lang: str = "uk"
+    deezer_id: int, lang: str = "uk", is_preview: bool = False
 ) -> InlineKeyboardMarkup:
-    """Дворядкове підменю вибору аудіо-ефектів (2x2)."""
+    """Дворядкове підменю вибору аудіо-ефектів (2×2)."""
     t = TEXTS.get(lang, TEXTS["uk"])
+    back_cb = f"fxbp:{deezer_id}" if is_preview else f"fxb:{deezer_id}"
     return InlineKeyboardMarkup(
         [
             [
@@ -522,7 +551,7 @@ def _build_effects_submenu_keyboard(
             ],
             [
                 InlineKeyboardButton("🔊 Bass Boost", callback_data=f"fx:bass:{deezer_id}"),
-                InlineKeyboardButton(t["btn_back"], callback_data=f"fxb:{deezer_id}"),
+                InlineKeyboardButton(t["btn_back"], callback_data=back_cb),
             ],
         ]
     )
@@ -906,7 +935,15 @@ async def preview_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 mp3_bytes = await download_url_bytes(preview_url)
 
     caption = _build_preview_caption(artist, title, duration, lang=lang)
-    reply_markup = _build_download_keyboard(deezer_id, duration, lang=lang)
+    reply_markup = _build_track_actions_keyboard(
+        deezer_id,
+        user_id=callback_query.from_user.id if callback_query.from_user else None,
+        lang=lang,
+        is_inline=False,
+        artist=artist,
+        include_download=True,
+        duration=duration,
+    )
 
     if mp3_bytes:
         ogg_bytes = await convert_preview_to_ogg(mp3_bytes)
@@ -1040,7 +1077,15 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             caption = _build_preview_caption(
                 track["artist"], track["title"], duration, lang=lang
             )
-            keyboard = _build_download_keyboard(deezer_id, duration, lang=lang)
+            keyboard = _build_track_actions_keyboard(
+                deezer_id,
+                user_id=user.id,
+                lang=lang,
+                is_inline=True,
+                artist=track["artist"],
+                include_download=True,
+                duration=duration,
+            )
 
             results.append(
                 InlineQueryResultAudio(
@@ -1055,7 +1100,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
 
-    cache_ttl = 5 if is_fav_query else 15
+    cache_ttl = 2
     await update.inline_query.answer(
         results, cache_time=cache_ttl, is_personal=True, button=inline_button
     )
@@ -1433,7 +1478,7 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
         logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
 
 
-# === Callback: Додавання / видалення з Вибраного (fav:<deezer_id>) ===
+# === Callback: Додавання / видалення з Вибраного (fav:<deezer_id> або favp:<deezer_id>) ===
 async def favorite_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Додає або видаляє трек із Вибраного користувача в один клік."""
     query = update.callback_query
@@ -1447,6 +1492,7 @@ async def favorite_callback_handler(update: Update, context: ContextTypes.DEFAUL
         await query.answer(t["invalid_data"])
         return
 
+    is_preview = parts[0] == "favp"
     deezer_id = int(parts[1])
     user_id = query.from_user.id
     track = await _resolve_track_meta(deezer_id, context)
@@ -1462,6 +1508,8 @@ async def favorite_callback_handler(update: Update, context: ContextTypes.DEFAUL
         lang=lang,
         is_inline=is_inline,
         artist=track.get("artist", ""),
+        include_download=is_preview,
+        duration=int(track.get("duration") or 0),
     )
     try:
         if is_inline:
@@ -1501,7 +1549,7 @@ def _paginate_lyrics(lyrics: str, max_escaped_chars: int) -> list[str]:
     return pages or [html.escape(lyrics[:max_escaped_chars])]
 
 
-# === Callback: Текст пісні (lyr:<deezer_id>[:<page>] та lyrc:<deezer_id>) ===
+# === Callback: Текст пісні (lyr[p]:<deezer_id>[:<page>] та lyrc[p]:<deezer_id>) ===
 async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показує повний текст пісні з посторінковою навігацією (без обрізання куплетів)."""
     query = update.callback_query
@@ -1516,6 +1564,7 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     action = parts[0]
+    is_preview = action in ("lyrp", "lyrcp")
     deezer_id = int(parts[1])
     page = int(parts[2]) if (len(parts) >= 3 and parts[2].isdigit()) else 0
     is_page_turn = len(parts) >= 3
@@ -1529,15 +1578,26 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     duration = int(track.get("duration") or 0)
 
     # Згортання тексту назад в інлайн-повідомленні
-    if action == "lyrc" and is_inline:
+    if action in ("lyrc", "lyrcp") and is_inline:
         await query.answer()
+        restored_caption = (
+            _build_preview_caption(artist, title, duration, lang=lang)
+            if is_preview
+            else _build_full_caption(artist, title, album, duration, lang=lang)
+        )
         try:
             await context.bot.edit_message_caption(
                 inline_message_id=query.inline_message_id,
-                caption=_build_full_caption(artist, title, album, duration, lang=lang),
+                caption=restored_caption,
                 parse_mode=ParseMode.HTML,
                 reply_markup=_build_track_actions_keyboard(
-                    deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
+                    deezer_id,
+                    user_id=user_id,
+                    lang=lang,
+                    is_inline=True,
+                    artist=artist,
+                    include_download=is_preview,
+                    duration=duration,
                 ),
             )
         except Exception:
@@ -1574,25 +1634,28 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         total_pages = len(pages)
         page = max(0, min(page, total_pages - 1))
 
+        lyr_prefix = "lyrp" if is_preview else "lyr"
+        lyrc_prefix = "lyrcp" if is_preview else "lyrc"
+
         inline_caption = f"{header}<blockquote>{pages[page]}</blockquote>"
         kb_rows = []
         if total_pages > 1:
             nav_row = []
             if page > 0:
                 nav_row.append(
-                    InlineKeyboardButton("⬅️", callback_data=f"lyr:{deezer_id}:{page - 1}")
+                    InlineKeyboardButton("⬅️", callback_data=f"{lyr_prefix}:{deezer_id}:{page - 1}")
                 )
             nav_row.append(
-                InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"lyr:{deezer_id}:{page}")
+                InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"{lyr_prefix}:{deezer_id}:{page}")
             )
             if page < total_pages - 1:
                 nav_row.append(
-                    InlineKeyboardButton("➡️", callback_data=f"lyr:{deezer_id}:{page + 1}")
+                    InlineKeyboardButton("➡️", callback_data=f"{lyr_prefix}:{deezer_id}:{page + 1}")
                 )
             kb_rows.append(nav_row)
 
         kb_rows.append(
-            [InlineKeyboardButton(t["btn_hide_lyrics"], callback_data=f"lyrc:{deezer_id}")]
+            [InlineKeyboardButton(t["btn_hide_lyrics"], callback_data=f"{lyrc_prefix}:{deezer_id}")]
         )
 
         try:
@@ -1690,13 +1753,13 @@ async def similar_callback_handler(update: Update, context: ContextTypes.DEFAULT
         )
 
 
-# === Callback: Аудіо-ефекти (fxm:<id>, fxb:<id>, fx:<effect>:<id>) ===
+# === Callback: Аудіо-ефекти (fxm[p]:<id>, fxb[p]:<id>, fx:<effect>:<id>) ===
 async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обробляє меню ефектів (Slowed + Reverb, Speed Up, Bass Boost):
-    - fxm:<id> — розгортає підменю ефектів
-    - fxb:<id> — повертає основну панель дій
-    - fx:<effect>:<id> — генерує та надсилає трек з обраним ефектом
+    Обробляє меню ефектів (Slowed + Reverb, Speed Up, Bass Boost) як у чаті, так і в @ім'я_бота інлайн-режимі:
+    - fxm:<id> / fxmp:<id> — розгортає підменю ефектів (2×2)
+    - fxb:<id> / fxbp:<id> — повертає основну панель дій
+    - fx:<effect>:<id> — генерує трек з обраним ефектом (у чаті надсилає MP3, в інлайн-режимі замінює плеєр на місці)
     """
     query = update.callback_query
     if not query or not query.data:
@@ -1705,37 +1768,50 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
     lang = _get_lang(query.from_user)
     t = TEXTS[lang]
     user_id = query.from_user.id if query.from_user else 0
+    is_inline = query.inline_message_id is not None
     parts = query.data.split(":")
 
-    if parts[0] == "fxm" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+    if parts[0] in ("fxm", "fxmp") and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
         deezer_id = int(parts[1])
+        is_preview = parts[0] == "fxmp"
         await query.answer()
-        if query.message:
-            try:
-                await query.message.edit_reply_markup(
-                    reply_markup=_build_effects_submenu_keyboard(deezer_id, lang=lang)
+        sub_kb = _build_effects_submenu_keyboard(deezer_id, lang=lang, is_preview=is_preview)
+        try:
+            if is_inline:
+                await context.bot.edit_message_reply_markup(
+                    inline_message_id=query.inline_message_id,
+                    reply_markup=sub_kb,
                 )
-            except Exception:
-                pass
+            elif query.message:
+                await query.message.edit_reply_markup(reply_markup=sub_kb)
+        except Exception:
+            pass
         return
 
-    if parts[0] == "fxb" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+    if parts[0] in ("fxb", "fxbp") and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
         deezer_id = int(parts[1])
+        is_preview = parts[0] == "fxbp"
         track = await _resolve_track_meta(deezer_id, context)
         await query.answer()
-        if query.message:
-            try:
-                await query.message.edit_reply_markup(
-                    reply_markup=_build_track_actions_keyboard(
-                        deezer_id,
-                        user_id=user_id,
-                        lang=lang,
-                        is_inline=False,
-                        artist=track.get("artist", ""),
-                    )
+        main_kb = _build_track_actions_keyboard(
+            deezer_id,
+            user_id=user_id,
+            lang=lang,
+            is_inline=is_inline,
+            artist=track.get("artist", ""),
+            include_download=is_preview,
+            duration=int(track.get("duration") or 0),
+        )
+        try:
+            if is_inline:
+                await context.bot.edit_message_reply_markup(
+                    inline_message_id=query.inline_message_id,
+                    reply_markup=main_kb,
                 )
-            except Exception:
-                pass
+            elif query.message:
+                await query.message.edit_reply_markup(reply_markup=main_kb)
+        except Exception:
+            pass
         return
 
     if parts[0] == "fx" and len(parts) >= 3 and parts[2].lstrip("-").isdigit():
@@ -1749,8 +1825,154 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
         artist = track["artist"]
         title = track["title"]
         duration = int(track.get("duration") or 0)
+        fx_title = f"{title} ({effect_label})"
 
-        # Повертаємо основний ряд кнопок на оригінальному треку
+        # Сценарій А: Інлайн-повідомлення (@ім'я_бота в будь-якому чаті) -> заміна аудіо на місці
+        if is_inline:
+            cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
+            if cached_fx_id:
+                try:
+                    await context.bot.edit_message_media(
+                        inline_message_id=query.inline_message_id,
+                        media=InputMediaAudio(
+                            media=cached_fx_id,
+                            title=fx_title,
+                            performer=artist,
+                            caption=_build_full_caption(
+                                artist, title, "", 0, lang=lang, effect_label=effect_label
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        reply_markup=_build_track_actions_keyboard(
+                            deezer_id,
+                            user_id=user_id,
+                            lang=lang,
+                            is_inline=True,
+                            artist=artist,
+                            show_original_btn=True,
+                            duration=duration,
+                        ),
+                    )
+                    return
+                except Exception:
+                    pass
+
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=query.inline_message_id,
+                    caption=t["effect_processing"].format(
+                        effect=html.escape(effect_label),
+                        artist=html.escape(artist),
+                        title=html.escape(title),
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+            lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
+            async with lock:
+                base_path = None
+                fx_path = None
+                temp_dl_dir = None
+                try:
+                    base_file_id = cache.get_file_id(deezer_id)
+                    if base_file_id:
+                        try:
+                            tg_file = await context.bot.get_file(base_file_id)
+                            temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
+                            candidate_path = os.path.join(temp_dl_dir, "base.mp3")
+                            await tg_file.download_to_drive(custom_path=candidate_path)
+                            if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
+                                base_path = candidate_path
+                        except Exception:
+                            pass
+
+                    if not base_path:
+                        base_path = await download_track(artist, title, target_duration=duration)
+
+                    if not base_path or not os.path.exists(base_path):
+                        return
+
+                    fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
+                    if not fx_res:
+                        return
+
+                    fx_path, new_duration = fx_res
+                    caption = _build_full_caption(
+                        artist, title, "", new_duration, lang=lang, effect_label=effect_label
+                    )
+
+                    upload_chats = []
+                    if STORAGE_CHAT_ID:
+                        try:
+                            upload_chats.append((int(STORAGE_CHAT_ID), False))
+                        except ValueError:
+                            upload_chats.append((STORAGE_CHAT_ID, False))
+                    upload_chats.append((user_id, True))
+                    for known_uid in cache.get_known_user_ids():
+                        if known_uid != user_id:
+                            upload_chats.append((known_uid, True))
+
+                    fx_file_id = None
+                    for chat_dest, delete_after in upload_chats:
+                        try:
+                            with open(fx_path, "rb") as audio_f:
+                                sent = await context.bot.send_audio(
+                                    chat_id=chat_dest,
+                                    audio=audio_f,
+                                    title=fx_title,
+                                    performer=artist,
+                                    duration=new_duration if new_duration > 0 else None,
+                                    caption=caption,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_notification=True,
+                                    read_timeout=120,
+                                    write_timeout=120,
+                                )
+                                if sent and sent.audio:
+                                    fx_file_id = sent.audio.file_id
+                                    cache.save_effect_file_id(deezer_id, effect, fx_file_id)
+                                    if delete_after:
+                                        try:
+                                            await sent.delete()
+                                        except Exception:
+                                            pass
+                                    break
+                        except Exception:
+                            continue
+
+                    if fx_file_id:
+                        await context.bot.edit_message_media(
+                            inline_message_id=query.inline_message_id,
+                            media=InputMediaAudio(
+                                media=fx_file_id,
+                                title=fx_title,
+                                performer=artist,
+                                duration=new_duration if new_duration > 0 else None,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            ),
+                            reply_markup=_build_track_actions_keyboard(
+                                deezer_id,
+                                user_id=user_id,
+                                lang=lang,
+                                is_inline=True,
+                                artist=artist,
+                                show_original_btn=True,
+                                duration=duration,
+                            ),
+                        )
+                finally:
+                    if base_path:
+                        cleanup_file(base_path)
+                    if fx_path:
+                        cleanup_file(fx_path)
+                    if temp_dl_dir and os.path.exists(temp_dl_dir):
+                        cleanup_file(os.path.join(temp_dl_dir, "base.mp3"))
+            return
+
+        # Сценарій Б: Звичайний чат з ботом
         if query.message:
             try:
                 await query.message.edit_reply_markup(
@@ -1772,6 +1994,9 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
                         artist, title, "", 0, lang=lang, effect_label=effect_label
                     ),
                     parse_mode=ParseMode.HTML,
+                    reply_markup=_build_track_actions_keyboard(
+                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                    ),
                 )
                 return
             except Exception:
@@ -1819,7 +2044,6 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
                     return
 
                 fx_path, new_duration = fx_res
-                fx_title = f"{title} ({effect_label})"
                 caption = _build_full_caption(
                     artist, title, "", new_duration, lang=lang, effect_label=effect_label
                 )
@@ -1832,6 +2056,9 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
                         duration=new_duration if new_duration > 0 else None,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
+                        reply_markup=_build_track_actions_keyboard(
+                            deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                        ),
                         read_timeout=120,
                         write_timeout=120,
                     )
@@ -2011,10 +2238,10 @@ def main():
     app.add_handler(CallbackQueryHandler(lang_callback_handler, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(preview_callback_handler, pattern=r"^pv:"))
     app.add_handler(CallbackQueryHandler(download_callback_handler, pattern=r"^dl:"))
-    app.add_handler(CallbackQueryHandler(favorite_callback_handler, pattern=r"^fav:"))
-    app.add_handler(CallbackQueryHandler(lyrics_callback_handler, pattern=r"^lyr[c]?:"))
+    app.add_handler(CallbackQueryHandler(favorite_callback_handler, pattern=r"^favp?:"))
+    app.add_handler(CallbackQueryHandler(lyrics_callback_handler, pattern=r"^lyrc?p?:"))
     app.add_handler(CallbackQueryHandler(similar_callback_handler, pattern=r"^sim:"))
-    app.add_handler(CallbackQueryHandler(effects_callback_handler, pattern=r"^fx[mb]?:"))
+    app.add_handler(CallbackQueryHandler(effects_callback_handler, pattern=r"^fx([mb]p?)?:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_search_handler)
     )
