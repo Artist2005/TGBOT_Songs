@@ -93,9 +93,14 @@ FFMPEG_PATH = _resolve_ffmpeg_path()
 def _make_match_filter(target_duration: int = 0):
     """
     Створює фільтр для відсіювання стрімів, 30-секундних Go+ прев'ю та багатогодинних міксів.
+    Якщо відома цільова тривалість треку (target_duration), відсіює 10-хвилинні DJ-сети та ремікси.
     """
-    max_duration = max(int(target_duration * 2.5), 900) if target_duration > 0 else 900
-    min_duration = 45 if (target_duration == 0 or target_duration >= 50) else 15
+    if target_duration > 0:
+        max_duration = min(max(int(target_duration * 1.45), target_duration + 75), 900)
+        min_duration = max(45, int(target_duration * 0.55)) if target_duration >= 60 else 15
+    else:
+        max_duration = 600
+        min_duration = 45
 
     def _filter(info_dict, *, incomplete: bool = False):
         if info_dict.get("is_live"):
@@ -186,20 +191,35 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
 
     attempts = [
         (
-            f"scsearch5:{query}",
+            f"scsearch8:{query}",
             {},
-        ),
-        (
-            f"ytsearch1:{query} official audio",
-            {"youtube": {"player_client": ["ios", "android", "mweb"]}},
-        ),
-        (
-            f"ytsearch1:{query}",
-            {"youtube": {"player_client": ["android", "tv", "ios"]}},
+            target_duration,
         ),
     ]
+    if target_duration > 0:
+        attempts.append(
+            (
+                f"scsearch10:{query}",
+                {},
+                0,
+            )
+        )
+    attempts.extend(
+        [
+            (
+                f"ytsearch1:{query} official audio",
+                {"youtube": {"player_client": ["ios", "android", "mweb"]}},
+                target_duration,
+            ),
+            (
+                f"ytsearch1:{query}",
+                {"youtube": {"player_client": ["android", "tv", "ios"]}},
+                0,
+            ),
+        ]
+    )
 
-    for search_query, extractor_args in attempts:
+    for search_query, extractor_args, dur_hint in attempts:
         for old_f in os.listdir(output_dir):
             try:
                 os.remove(os.path.join(output_dir, old_f))
@@ -209,7 +229,7 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
         ydl_opts = {
             "format": "http_mp3_128/hls_mp3_128/bestaudio[ext=mp3]/bestaudio[ext=m4a][abr<=192]/bestaudio[ext=webm][abr<=192]/bestaudio/best",
             "outtmpl": output_template,
-            "concurrent_fragment_downloads": 8,
+            "concurrent_fragment_downloads": 4,
             "cachedir": YTDLP_CACHE_DIR,
             "quiet": True,
             "no_warnings": True,
@@ -217,7 +237,7 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
             "lazy_playlist": True,
             "max_downloads": 1,
             "max_filesize": 48 * 1024 * 1024,
-            "match_filter": _make_match_filter(target_duration),
+            "match_filter": _make_match_filter(dur_hint),
             "socket_timeout": 12,
             "retries": 2,
             "fragment_retries": 2,

@@ -35,7 +35,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -1177,26 +1177,38 @@ async def _ensure_full_mp3_file_id(
                     is_inline=False,
                     artist=artist,
                 )
-                with open(file_path, "rb") as audio_f:
-                    sent = await context.bot.send_audio(
-                        chat_id=target_chat_id,
-                        audio=audio_f,
-                        title=title,
-                        performer=artist,
-                        duration=duration if duration > 0 else None,
-                        thumbnail=thumb_bytes,
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard,
-                        read_timeout=120,
-                        write_timeout=120,
-                    )
-                    if sent and sent.audio:
-                        file_id = sent.audio.file_id
-                        cache.save_file_id(
-                            deezer_id, title, artist, file_id, album, duration, cover_url
-                        )
-                        return file_id, True, False
+                upload_lock = _get_track_lock(f"upload:{target_chat_id}")
+                async with upload_lock:
+                    for attempt in range(3):
+                        try:
+                            with open(file_path, "rb") as audio_f:
+                                sent = await context.bot.send_audio(
+                                    chat_id=target_chat_id,
+                                    audio=audio_f,
+                                    title=title,
+                                    performer=artist,
+                                    duration=duration if duration > 0 else None,
+                                    thumbnail=thumb_bytes,
+                                    caption=caption,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=keyboard,
+                                    read_timeout=120,
+                                    write_timeout=120,
+                                )
+                                if sent and sent.audio:
+                                    file_id = sent.audio.file_id
+                                    cache.save_file_id(
+                                        deezer_id, title, artist, file_id, album, duration, cover_url
+                                    )
+                                    return file_id, True, False
+                        except RetryAfter as ra:
+                            await asyncio.sleep(float(ra.retry_after) + 0.5)
+                        except (TimedOut, NetworkError) as net_err:
+                            logger.warning(f"Upload attempt {attempt + 1} timed out: {net_err}")
+                            await asyncio.sleep(1.0)
+                        except Exception as chat_up_err:
+                            logger.warning(f"Direct chat upload failed: {chat_up_err}")
+                            break
 
             upload_chats = []
             if STORAGE_CHAT_ID:
@@ -1211,36 +1223,46 @@ async def _ensure_full_mp3_file_id(
 
             needs_start = False
             for chat_dest, delete_after in upload_chats:
-                try:
-                    with open(file_path, "rb") as audio_f:
-                        sent = await context.bot.send_audio(
-                            chat_id=chat_dest,
-                            audio=audio_f,
-                            title=title,
-                            performer=artist,
-                            duration=duration if duration > 0 else None,
-                            thumbnail=thumb_bytes,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                            disable_notification=True,
-                            read_timeout=120,
-                            write_timeout=120,
-                        )
-                        if sent and sent.audio:
-                            file_id = sent.audio.file_id
-                            cache.save_file_id(
-                                deezer_id, title, artist, file_id, album, duration, cover_url
-                            )
-                            if delete_after:
-                                try:
-                                    await sent.delete()
-                                except Exception as del_err:
-                                    logger.debug(f"Could not delete temp DM msg: {del_err}")
-                            return file_id, False, False
-                except Forbidden:
-                    needs_start = True
-                except Exception as upload_err:
-                    logger.warning(f"Upload to {chat_dest} failed: {upload_err}")
+                upload_lock = _get_track_lock(f"upload:{chat_dest}")
+                async with upload_lock:
+                    for attempt in range(3):
+                        try:
+                            with open(file_path, "rb") as audio_f:
+                                sent = await context.bot.send_audio(
+                                    chat_id=chat_dest,
+                                    audio=audio_f,
+                                    title=title,
+                                    performer=artist,
+                                    duration=duration if duration > 0 else None,
+                                    thumbnail=thumb_bytes,
+                                    caption=caption,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_notification=True,
+                                    read_timeout=120,
+                                    write_timeout=120,
+                                )
+                                if sent and sent.audio:
+                                    file_id = sent.audio.file_id
+                                    cache.save_file_id(
+                                        deezer_id, title, artist, file_id, album, duration, cover_url
+                                    )
+                                    if delete_after:
+                                        try:
+                                            await sent.delete()
+                                        except Exception as del_err:
+                                            logger.debug(f"Could not delete temp DM msg: {del_err}")
+                                    return file_id, False, False
+                        except Forbidden:
+                            needs_start = True
+                            break
+                        except RetryAfter as ra:
+                            await asyncio.sleep(float(ra.retry_after) + 0.5)
+                        except (TimedOut, NetworkError) as net_err:
+                            logger.warning(f"Upload to {chat_dest} attempt {attempt + 1} timed out: {net_err}")
+                            await asyncio.sleep(1.0)
+                        except Exception as upload_err:
+                            logger.warning(f"Upload to {chat_dest} failed: {upload_err}")
+                            break
 
             return None, False, needs_start
 
@@ -1474,21 +1496,31 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
         deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
     )
 
-    try:
-        await context.bot.edit_message_media(
-            inline_message_id=callback_query.inline_message_id,
-            media=InputMediaAudio(
-                media=file_id,
-                title=title,
-                performer=artist,
-                duration=duration if duration > 0 else None,
-                caption=full_caption,
-                parse_mode=ParseMode.HTML,
-            ),
-            reply_markup=inline_actions_kb,
-        )
-    except TelegramError as e:
-        logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
+    for attempt in range(3):
+        try:
+            await context.bot.edit_message_media(
+                inline_message_id=callback_query.inline_message_id,
+                media=InputMediaAudio(
+                    media=file_id,
+                    title=title,
+                    performer=artist,
+                    duration=duration if duration > 0 else None,
+                    caption=full_caption,
+                    parse_mode=ParseMode.HTML,
+                ),
+                reply_markup=inline_actions_kb,
+            )
+            break
+        except RetryAfter as ra:
+            await asyncio.sleep(float(ra.retry_after) + 0.5)
+        except (TimedOut, NetworkError) as net_err:
+            logger.warning(f"edit_message_media attempt {attempt + 1} timed out: {net_err}")
+            await asyncio.sleep(1.0)
+        except TelegramError as e:
+            if "Message is not modified" in str(e):
+                break
+            logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
+            break
 
 
 # === Callback: Додавання / видалення з Вибраного (fav:<deezer_id> або favp:<deezer_id>) ===
@@ -2238,6 +2270,13 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .connection_pool_size(64)
+        .pool_timeout(60.0)
+        .connect_timeout(20.0)
+        .read_timeout(120.0)
+        .write_timeout(120.0)
+        .get_updates_connection_pool_size(8)
+        .get_updates_pool_timeout(30.0)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
