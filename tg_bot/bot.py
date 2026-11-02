@@ -1020,13 +1020,12 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 track["artist"], track["title"], duration, lang=lang
             )
             keyboard = _build_download_keyboard(deezer_id, duration, lang=lang)
-            preview_tag = "[30s Preview]" if lang == "en" else "[Прев'ю 30 сек]"
 
             results.append(
                 InlineQueryResultAudio(
                     id=str(deezer_id),
                     audio_url=preview_url,
-                    title=f"🎧 {rank_prefix}{preview_tag} {track['title']} ({duration_str})",
+                    title=f"🎵 {rank_prefix}{track['title']} ({duration_str})",
                     performer=track["artist"],
                     audio_duration=30,
                     caption=caption,
