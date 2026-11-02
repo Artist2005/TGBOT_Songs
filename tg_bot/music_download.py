@@ -1,5 +1,7 @@
 """
-Модуль завантаження треків через yt-dlp та роботи з FFmpeg.
+Модуль швидкого завантаження треків через yt-dlp та роботи з FFmpeg.
+Оптимізований для максимальної швидкості пошуку на YouTube, багатопотокового
+завантаження фрагментів та конвертації в MP3.
 """
 
 import os
@@ -9,11 +11,16 @@ import tempfile
 import asyncio
 import subprocess
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 
 logger = logging.getLogger(__name__)
 
 TEMP_PREFIX = "tgbot_dl_"
+YTDLP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tgbot_ytdlp_cache")
+
+# Окремий пул потоків для завантажень та FFmpeg, щоб не блокувати основний цикл
+_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="music_dl")
 
 
 def _resolve_ffmpeg_path() -> Optional[str]:
@@ -29,6 +36,12 @@ def _resolve_ffmpeg_path() -> Optional[str]:
     which_ffmpeg = shutil.which("ffmpeg")
     if which_ffmpeg:
         return which_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
 
     return None
 
@@ -56,11 +69,12 @@ def _make_match_filter(target_duration: int = 0):
 
 
 def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> Optional[str]:
-    """Синхронна функція завантаження через yt-dlp із захистом від хибних відео."""
+    """Синхронна функція швидкого завантаження через yt-dlp."""
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        # Обираємо легкий аудіопотік (m4a/webm до 192k), який качається в рази швидше за відео
+        "format": "bestaudio[ext=m4a][abr<=192]/bestaudio[ext=webm][abr<=192]/bestaudio/best",
         "outtmpl": output_template,
         "postprocessors": [
             {
@@ -68,24 +82,22 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             },
-            {
-                "key": "FFmpegMetadata",
-                "add_metadata": True,
-            },
         ],
+        "postprocessor_args": {
+            "extractaudio": ["-threads", "0"],
+        },
+        "concurrent_fragment_downloads": 4,
+        "cachedir": YTDLP_CACHE_DIR,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "lazy_playlist": True,
         "default_search": "ytsearch1",
         "max_filesize": 48 * 1024 * 1024,  # Ліміт Telegram Bot API (50 MB)
         "match_filter": _make_match_filter(target_duration),
-        "socket_timeout": 15,
-        "retries": 3,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "mweb", "ios"],
-            }
-        },
+        "socket_timeout": 10,
+        "retries": 2,
+        "fragment_retries": 2,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -97,12 +109,12 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
     if FFMPEG_PATH:
         ydl_opts["ffmpeg_location"] = FFMPEG_PATH
 
-    search_Variants = [
+    search_variants = [
         f"ytsearch1:{query} official audio",
         f"ytsearch1:{query}",
     ]
 
-    for search_query in search_Variants:
+    for search_query in search_variants:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(search_query, download=True)
@@ -123,7 +135,6 @@ def _yt_dlp_download(query: str, output_dir: str, target_duration: int = 0) -> O
                 if os.path.exists(filename) and os.path.getsize(filename) > 0:
                     return filename
 
-                # Fallback: перевірка будь-якого .mp3 у тимчасовій папці
                 for f in os.listdir(output_dir):
                     full_p = os.path.join(output_dir, f)
                     if f.endswith(".mp3") and os.path.getsize(full_p) > 0:
@@ -145,7 +156,7 @@ async def download_track(
 
     try:
         file_path = await loop.run_in_executor(
-            None, _yt_dlp_download, query, temp_dir, target_duration
+            _executor, _yt_dlp_download, query, temp_dir, target_duration
         )
         if not file_path or not os.path.exists(file_path):
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -167,6 +178,8 @@ def _convert_mp3_to_ogg_sync(mp3_bytes: bytes) -> Optional[bytes]:
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-threads",
+                "0",
                 "-i",
                 "pipe:0",
                 "-c:a",
@@ -184,7 +197,7 @@ def _convert_mp3_to_ogg_sync(mp3_bytes: bytes) -> Optional[bytes]:
             input=mp3_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=15,
+            timeout=12,
             check=False,
         )
         if proc.returncode == 0 and proc.stdout:
@@ -204,7 +217,7 @@ async def convert_preview_to_ogg(mp3_bytes: bytes) -> Optional[bytes]:
     if not mp3_bytes:
         return None
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _convert_mp3_to_ogg_sync, mp3_bytes)
+    return await loop.run_in_executor(_executor, _convert_mp3_to_ogg_sync, mp3_bytes)
 
 
 def cleanup_file(filepath: str):
