@@ -1524,11 +1524,6 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             pass
         return
 
-    if not is_page_turn:
-        await query.answer(t["lyrics_loading_toast"])
-    else:
-        await query.answer()
-
     lyrics = await get_track_lyrics(artist, title)
 
     if not lyrics:
@@ -1536,6 +1531,7 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             artist=html.escape(artist), title=html.escape(title)
         )
         if not is_inline and query.message:
+            await query.answer()
             await query.message.reply_text(
                 not_found_msg,
                 parse_mode=ParseMode.HTML,
@@ -1547,11 +1543,13 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.answer(re.sub(r"<[^>]+>", "", not_found_msg), show_alert=True)
         return
 
+    await query.answer()
+
     if is_inline:
         # В інлайн-повідомленні ліміт підпису (caption) у Telegram — 1024 символи,
         # тому розбиваємо довгий текст пісні на зручні сторінки з кнопками ⬅️ / ➡️
         header = f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
-        max_page_chars = max(400, 950 - len(header))
+        max_page_chars = max(350, 780 - len(header))
         pages = _paginate_lyrics(lyrics, max_page_chars)
         total_pages = len(pages)
         page = max(0, min(page, total_pages - 1))
@@ -1585,7 +1583,7 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=InlineKeyboardMarkup(kb_rows),
             )
         except Exception as e:
-            logger.debug(f"Could not show inline lyrics: {e}")
+            logger.warning(f"Could not show inline lyrics: {e}")
         return
 
     # У звичайному чаті ліміт повідомлення — 4096 символів (вміщує всю пісню цілком, або з пагінацією для дуже довгих)

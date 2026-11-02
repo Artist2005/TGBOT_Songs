@@ -262,14 +262,81 @@ async def get_similar_tracks(
 
 
 def _clean_song_term(term: str) -> str:
-    """Очищує назву треку від службових дужок типу (Official Video), [prod. ...] для кращого пошуку тексту."""
-    cleaned = re.sub(r"\s*[\(\[][^)\]]*(?:official|video|audio|lyric|remaster|feat\.|ft\.|prod\.)[^)\]]*[\)\]]", "", term, flags=re.IGNORECASE)
+    """Очищує назву треку від службових дужок типу (Official Video), (with ...), [prod. ...] для точного пошуку тексту."""
+    cleaned = re.sub(
+        r"\s*[\(\[][^)\]]*(?:official|video|audio|lyric|remaster|feat\.?|ft\.?|with\s|prod\.?)[^)\]]*[\)\]]",
+        "",
+        term,
+        flags=re.IGNORECASE,
+    )
     return cleaned.strip() or term.strip()
+
+
+async def _fetch_netease_lyrics(
+    session: aiohttp.ClientSession, clean_artist: str, clean_title: str
+) -> Optional[str]:
+    """
+    Швидкий пошук тексту пісні через NetEase Music API (<250 мс, підтримує кирилицю та латиницю без лімітів 429/503).
+    """
+    queries = [f"{clean_artist} {clean_title}".strip(), clean_title]
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://music.163.com/",
+    }
+    for q in queries:
+        if not q:
+            continue
+        try:
+            async with session.post(
+                "https://music.163.com/api/search/get",
+                data={"s": q, "type": "1", "offset": "0", "total": "true", "limit": "4"},
+                headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                res = await resp.json(content_type=None)
+                result = res.get("result") if isinstance(res, dict) else None
+                if not isinstance(result, dict):
+                    continue
+                songs = result.get("songs") or []
+                for song in songs[:3]:
+                    sid = song.get("id")
+                    if not sid:
+                        continue
+                    async with session.get(
+                        f"https://music.163.com/api/song/lyric?os=pc&id={sid}&lv=-1",
+                        headers=headers,
+                    ) as lresp:
+                        if lresp.status != 200:
+                            continue
+                        lres = await lresp.json(content_type=None)
+                        raw = ((lres.get("lrc") or {}).get("lyric") or "") if isinstance(lres, dict) else ""
+                        if not raw:
+                            continue
+                        lines = []
+                        for line in raw.splitlines():
+                            cleaned_line = re.sub(r"\[[^\]]+\]", "", line).strip()
+                            if re.match(
+                                r"^(?:作词|作曲|编曲|制作人|混音|母带|Lyricist|Composer|Arranger|Producer)\s*[:：]",
+                                cleaned_line,
+                                re.IGNORECASE,
+                            ):
+                                continue
+                            lines.append(cleaned_line)
+                        text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+                        if len(text) > 100:
+                            return text
+        except Exception as e:
+            logger.debug(f"NetEase lyrics lookup failed for '{q}': {e}")
+    return None
 
 
 async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
     """
-    Шукає повний текст пісні (Lyrics) через безкоштовний API LRCLIB (з фолбеком на lyrics.ovh).
+    Шукає повний текст пісні (Lyrics) через:
+    1) LRCLIB API (для латиниці)
+    2) NetEase Cloud Music API (універсальне джерело: кирилиця + світові треки, без лімітів 503/429)
+    3) lyrics.ovh (резервний фолбек)
     """
     if not title:
         return None
@@ -282,9 +349,10 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
         return _lyrics_cache[cache_key]
 
     session = await _get_session()
+    is_ascii_query = f"{clean_artist}{clean_title}".isascii()
 
-    # 1. Прямий запит до LRCLIB /api/get
-    if clean_artist:
+    # 1. Прямий запит до LRCLIB /api/get (тільки для ASCII, бо на кирилиці LRCLIB віддає 503)
+    if clean_artist and is_ascii_query:
         try:
             async with session.get(
                 LRCLIB_GET_URL,
@@ -300,23 +368,30 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
         except Exception as e:
             logger.debug(f"LRCLIB direct get failed: {e}")
 
-    # 2. Пошук через LRCLIB /api/search
-    search_q = f"{clean_artist} {clean_title}".strip()
-    try:
-        async with session.get(LRCLIB_SEARCH_URL, params={"q": search_q}) as resp:
-            if resp.status == 200:
-                items = await resp.json()
-                if isinstance(items, list):
-                    for item in items:
-                        lyrics = (item.get("plainLyrics") or "").strip()
-                        if lyrics:
-                            lyrics = re.sub(r"\n{3,}", "\n\n", lyrics)
-                            _lyrics_cache[cache_key] = lyrics
-                            return lyrics
-    except Exception as e:
-        logger.debug(f"LRCLIB search failed: {e}")
+    # 2. Швидкий пошук через NetEase Music API (працює і для українських/кириличних, і для світових пісень)
+    netease_res = await _fetch_netease_lyrics(session, clean_artist, clean_title)
+    if netease_res:
+        _lyrics_cache[cache_key] = netease_res
+        return netease_res
 
-    # 3. Фолбек на lyrics.ovh
+    # 3. Пошук через LRCLIB /api/search (якщо запит латиницею)
+    if is_ascii_query:
+        search_q = f"{clean_artist} {clean_title}".strip()
+        try:
+            async with session.get(LRCLIB_SEARCH_URL, params={"q": search_q}) as resp:
+                if resp.status == 200:
+                    items = await resp.json()
+                    if isinstance(items, list):
+                        for item in items:
+                            lyrics = (item.get("plainLyrics") or "").strip()
+                            if lyrics:
+                                lyrics = re.sub(r"\n{3,}", "\n\n", lyrics)
+                                _lyrics_cache[cache_key] = lyrics
+                                return lyrics
+        except Exception as e:
+            logger.debug(f"LRCLIB search failed: {e}")
+
+    # 4. Фолбек на lyrics.ovh
     if clean_artist:
         try:
             ovh_url = LYRICS_OVH_URL.format(
