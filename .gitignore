@@ -1,0 +1,11 @@
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+.env
+*.log
+*.db
+*.db-journal
+*.db-wal
+*.tar.gz
