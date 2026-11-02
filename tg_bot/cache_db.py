@@ -483,3 +483,37 @@ class CacheDB:
     def get_cache_size(self) -> int:
         """Повертає кількість закешованих MP3 треків."""
         return len(self._file_ids)
+
+    def get_admin_stats(self) -> dict:
+        """Збирає повну статистику бази даних для адмін-панелі."""
+        db_size_kb = 0.0
+        try:
+            if os.path.exists(self.db_path):
+                db_size_kb = os.path.getsize(self.db_path) / 1024.0
+        except Exception:
+            pass
+
+        recent_tracks = []
+        total_favs = sum(len(v) for v in self._favorites.values())
+        try:
+            with closing(self._connect()) as conn:
+                conn.row_factory = sqlite3.Row
+                for row in conn.execute(
+                    "SELECT artist, title, created_at FROM track_cache "
+                    "WHERE file_id IS NOT NULL AND file_id != '' "
+                    "ORDER BY created_at DESC LIMIT 5"
+                ):
+                    recent_tracks.append(f"{row['artist']} — {row['title']}")
+        except sqlite3.Error as e:
+            logger.debug(f"Admin stats query error: {e}")
+
+        return {
+            "users_count": len(self._langs),
+            "cached_mp3_count": len(self._file_ids),
+            "cached_effects_count": len(self._effects),
+            "known_tracks_count": len(self._meta),
+            "favorites_count": total_favs,
+            "db_size_kb": round(db_size_kb, 1),
+            "recent_tracks": recent_tracks,
+        }
+

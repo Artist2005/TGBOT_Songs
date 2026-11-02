@@ -76,6 +76,19 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STORAGE_CHAT_ID = os.getenv("STORAGE_CHAT_ID")
 
+# Доступ до адмін-панелі (/admin, /stats) має ВИКЛЮЧНО власник бота (Telegram ID: 1001308094)
+# та додаткові ID, якщо вони прописані через кому в ADMIN_IDS у .env
+ADMIN_IDS: set[int] = {1001308094}
+for _raw_id in (os.getenv("ADMIN_IDS") or "").split(","):
+    _raw_id = _raw_id.strip()
+    if _raw_id.isdigit():
+        ADMIN_IDS.add(int(_raw_id))
+
+
+def _is_admin(user_id: Optional[int]) -> bool:
+    """Перевіряє, чи є користувач власником/адміністратором бота."""
+    return bool(user_id and int(user_id) in ADMIN_IDS)
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -1748,6 +1761,97 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
                     cleanup_file(os.path.join(temp_dl_dir, "base.mp3"))
 
 
+# === Адмін-панель (/admin або /stats) — виключно для власника бота ===
+def _format_admin_panel(lang: str = "uk") -> tuple[str, InlineKeyboardMarkup]:
+    """Формує текст і клавіатуру адмін-панелі."""
+    st = cache.get_admin_stats()
+    recent_list = (
+        "\n".join(f"  • {html.escape(item)}" for item in st["recent_tracks"])
+        if st["recent_tracks"]
+        else ("  • (ще немає)" if lang == "uk" else "  • (none yet)")
+    )
+
+    if lang == "en":
+        text = (
+            "🛡 <b>Bot Admin Panel</b>\n\n"
+            f"👥 <b>Known users:</b> {st['users_count']}\n"
+            f"⚡ <b>Cached MP3 tracks:</b> {st['cached_mp3_count']}\n"
+            f"🎛 <b>Cached audio effects:</b> {st['cached_effects_count']}\n"
+            f"🎵 <b>Indexed track metadata:</b> {st['known_tracks_count']}\n"
+            f"❤️ <b>Saved in Favorites:</b> {st['favorites_count']}\n"
+            f"💾 <b>Database size (cache.db):</b> {st['db_size_kb']} KB\n\n"
+            f"🕐 <b>Last 5 cached tracks:</b>\n{recent_list}"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="adm:refresh"),
+                    InlineKeyboardButton("🧹 Clean Temp", callback_data="adm:cleantmp"),
+                ],
+                [InlineKeyboardButton("✖️ Close", callback_data="delmsg")],
+            ]
+        )
+    else:
+        text = (
+            "🛡 <b>Адмін-панель бота</b>\n\n"
+            f"👥 <b>Користувачів у базі:</b> {st['users_count']}\n"
+            f"⚡ <b>Закешованих MP3 треків:</b> {st['cached_mp3_count']}\n"
+            f"🎛 <b>Закешованих аудіо-ефектів:</b> {st['cached_effects_count']}\n"
+            f"🎵 <b>Треків у базі метаданих:</b> {st['known_tracks_count']}\n"
+            f"❤️ <b>Додавань у «Вибране»:</b> {st['favorites_count']}\n"
+            f"💾 <b>Розмір бази (cache.db):</b> {st['db_size_kb']} КБ\n\n"
+            f"🕐 <b>Останні 5 закешованих треків:</b>\n{recent_list}"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔄 Оновити", callback_data="adm:refresh"),
+                    InlineKeyboardButton("🧹 Очистити Temp", callback_data="adm:cleantmp"),
+                ],
+                [InlineKeyboardButton("✖️ Закрити", callback_data="delmsg")],
+            ]
+        )
+    return text, kb
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрита команда /admin та /stats (доступна ТІЛЬКИ власнику бота)."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not _is_admin(user.id):
+        # Для сторонніх користувачів команда повністю ігнорується
+        return
+
+    lang = _get_lang(user)
+    text, kb = _format_admin_panel(lang=lang)
+    await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє кнопки в адмін-панелі (adm:refresh, adm:cleantmp)."""
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+
+    if not _is_admin(query.from_user.id):
+        await query.answer("⛔ Доступ лише для адміністратора", show_alert=True)
+        return
+
+    lang = _get_lang(query.from_user)
+    if query.data == "adm:cleantmp":
+        cleanup_temp_dir()
+        await query.answer("🧹 Тимчасові папки очищено!" if lang == "uk" else "🧹 Temp folders cleaned!")
+    else:
+        await query.answer("🔄 Оновлено" if lang == "uk" else "🔄 Refreshed")
+
+    text, kb = _format_admin_panel(lang=lang)
+    if query.message:
+        try:
+            await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+
 # === Global Error Handler ===
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
@@ -1804,8 +1908,10 @@ def main():
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler(["favorites", "fav"], favorites_command))
     app.add_handler(CommandHandler("lang", lang_command))
+    app.add_handler(CommandHandler(["admin", "stats"], admin_command))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(CallbackQueryHandler(nav_callback_handler, pattern=r"^(nav:|delmsg$)"))
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(lang_callback_handler, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(preview_callback_handler, pattern=r"^pv:"))
     app.add_handler(CallbackQueryHandler(download_callback_handler, pattern=r"^dl:"))
