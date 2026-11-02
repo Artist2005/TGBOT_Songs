@@ -1455,9 +1455,35 @@ async def favorite_callback_handler(update: Update, context: ContextTypes.DEFAUL
         pass
 
 
-# === Callback: Текст пісні (lyr:<deezer_id> та lyrc:<deezer_id>) ===
+def _paginate_lyrics(lyrics: str, max_escaped_chars: int) -> list[str]:
+    """
+    Розбиває повний текст пісні на сторінки по цілих рядках так,
+    щоб жоден рядок чи куплет не обрізався і вміщувався в ліміт Telegram.
+    """
+    pages: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for raw_line in lyrics.splitlines():
+        esc_line = html.escape(raw_line)
+        line_cost = len(esc_line) + 1
+        if current_lines and (current_len + line_cost > max_escaped_chars):
+            pages.append("\n".join(current_lines).strip())
+            current_lines = [esc_line]
+            current_len = line_cost
+        else:
+            current_lines.append(esc_line)
+            current_len += line_cost
+
+    if current_lines:
+        pages.append("\n".join(current_lines).strip())
+
+    return pages or [html.escape(lyrics[:max_escaped_chars])]
+
+
+# === Callback: Текст пісні (lyr:<deezer_id>[:<page>] та lyrc:<deezer_id>) ===
 async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показує текст пісні в згортаному блоці (<blockquote expandable>) без засмічення чату."""
+    """Показує повний текст пісні з посторінковою навігацією (без обрізання куплетів)."""
     query = update.callback_query
     if not query or not query.data:
         return
@@ -1471,6 +1497,9 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     action = parts[0]
     deezer_id = int(parts[1])
+    page = int(parts[2]) if (len(parts) >= 3 and parts[2].isdigit()) else 0
+    is_page_turn = len(parts) >= 3
+
     user_id = query.from_user.id if query.from_user else 0
     is_inline = query.inline_message_id is not None
     track = await _resolve_track_meta(deezer_id, context)
@@ -1495,7 +1524,11 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             pass
         return
 
-    await query.answer(t["lyrics_loading_toast"])
+    if not is_page_turn:
+        await query.answer(t["lyrics_loading_toast"])
+    else:
+        await query.answer()
+
     lyrics = await get_track_lyrics(artist, title)
 
     if not lyrics:
@@ -1515,43 +1548,88 @@ async def lyrics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if is_inline:
-        # В інлайн-повідомленні поміщаємо текст у згортаний блок у підписі (ліміт caption — 1024 символи)
+        # В інлайн-повідомленні ліміт підпису (caption) у Telegram — 1024 символи,
+        # тому розбиваємо довгий текст пісні на зручні сторінки з кнопками ⬅️ / ➡️
         header = f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
-        max_len = 940 - len(header)
-        trimmed = lyrics[:max_len] + ("..." if len(lyrics) > max_len else "")
-        inline_caption = f"{header}<blockquote expandable>{html.escape(trimmed)}</blockquote>"
+        max_page_chars = max(400, 950 - len(header))
+        pages = _paginate_lyrics(lyrics, max_page_chars)
+        total_pages = len(pages)
+        page = max(0, min(page, total_pages - 1))
+
+        inline_caption = f"{header}<blockquote>{pages[page]}</blockquote>"
+        kb_rows = []
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(
+                    InlineKeyboardButton("⬅️", callback_data=f"lyr:{deezer_id}:{page - 1}")
+                )
+            nav_row.append(
+                InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"lyr:{deezer_id}:{page}")
+            )
+            if page < total_pages - 1:
+                nav_row.append(
+                    InlineKeyboardButton("➡️", callback_data=f"lyr:{deezer_id}:{page + 1}")
+                )
+            kb_rows.append(nav_row)
+
+        kb_rows.append(
+            [InlineKeyboardButton(t["btn_hide_lyrics"], callback_data=f"lyrc:{deezer_id}")]
+        )
+
         try:
             await context.bot.edit_message_caption(
                 inline_message_id=query.inline_message_id,
                 caption=inline_caption,
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                t["btn_hide_lyrics"], callback_data=f"lyrc:{deezer_id}"
-                            )
-                        ]
-                    ]
-                ),
+                reply_markup=InlineKeyboardMarkup(kb_rows),
             )
         except Exception as e:
             logger.debug(f"Could not show inline lyrics: {e}")
         return
 
-    # У звичайному чаті надсилаємо згортану картку з кнопкою «Закрити»
+    # У звичайному чаті ліміт повідомлення — 4096 символів (вміщує всю пісню цілком, або з пагінацією для дуже довгих)
     header = t["lyrics_header"].format(
         artist=html.escape(artist), title=html.escape(title)
     )
-    trimmed = lyrics[:3700] + ("\n..." if len(lyrics) > 3700 else "")
-    text_body = f"{header}\n\n<blockquote expandable>{html.escape(trimmed)}</blockquote>"
+    pages = _paginate_lyrics(lyrics, 3600)
+    total_pages = len(pages)
+    page = max(0, min(page, total_pages - 1))
+
+    text_body = f"{header}\n\n<blockquote>{pages[page]}</blockquote>"
+    kb_rows = []
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton("⬅️", callback_data=f"lyr:{deezer_id}:{page - 1}")
+            )
+        nav_row.append(
+            InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"lyr:{deezer_id}:{page}")
+        )
+        if page < total_pages - 1:
+            nav_row.append(
+                InlineKeyboardButton("➡️", callback_data=f"lyr:{deezer_id}:{page + 1}")
+            )
+        kb_rows.append(nav_row)
+
+    kb_rows.append([InlineKeyboardButton(t["btn_close"], callback_data="delmsg")])
+
     if query.message:
+        if is_page_turn:
+            try:
+                await query.message.edit_text(
+                    text_body,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(kb_rows),
+                )
+                return
+            except Exception:
+                pass
         await query.message.reply_text(
             text_body,
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(t["btn_close"], callback_data="delmsg")]]
-            ),
+            reply_markup=InlineKeyboardMarkup(kb_rows),
         )
 
 
