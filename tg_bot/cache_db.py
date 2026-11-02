@@ -339,6 +339,10 @@ class CacheDB:
         except sqlite3.Error as e:
             logger.error(f"Failed to save user lang for {user_id}: {e}")
 
+    def get_known_user_ids(self) -> list[int]:
+        """Повертає список відомих user_id (для фонового отримання file_id в інлайн-режимі)."""
+        return list(self._langs.keys())
+
     def get_cache_size(self) -> int:
         """Повертає кількість закешованих MP3 треків."""
         return len(self._file_ids)

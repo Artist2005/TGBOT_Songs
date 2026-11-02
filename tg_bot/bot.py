@@ -348,6 +348,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lang = _get_lang(update.effective_user)
+    if update.effective_user and cache.get_user_lang(update.effective_user.id) is None:
+        cache.set_user_lang(update.effective_user.id, lang)
 
     if context.args and len(context.args) > 0:
         arg = context.args[0]
@@ -422,6 +424,8 @@ async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     lang = _get_lang(update.effective_user)
+    if update.effective_user and cache.get_user_lang(update.effective_user.id) is None:
+        cache.set_user_lang(update.effective_user.id, lang)
     t = TEXTS[lang]
 
     status_msg = await update.message.reply_text(
@@ -570,7 +574,6 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     results = []
-    fallback_results = []
     for track in tracks:
         deezer_id = int(track["id"])
         duration = int(track.get("duration") or 0)
@@ -595,30 +598,21 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=ParseMode.HTML,
             )
             results.append(cached_res)
-            fallback_results.append(cached_res)
         else:
             preview_url = track.get("preview_url") or SILENT_FALLBACK_URL
             caption = _build_preview_caption(
                 track["artist"], track["title"], duration, lang=lang
             )
             keyboard = _build_download_keyboard(deezer_id, duration, lang=lang)
+            preview_tag = "[30s Preview]" if lang == "en" else "[Прев'ю 30 сек]"
 
+            # Використовуємо InlineQueryResultAudio, щоб Telegram дозволяв замінити
+            # 30-секундне прев'ю на повний MP3 прямо в тому ж повідомленні чату (in-place)
             results.append(
-                InlineQueryResultVoice(
-                    id=str(deezer_id),
-                    voice_url=preview_url,
-                    title=f"🎤 {track['artist']} — {track['title']} ({duration_str})",
-                    voice_duration=30,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                )
-            )
-            fallback_results.append(
                 InlineQueryResultAudio(
                     id=str(deezer_id),
                     audio_url=preview_url,
-                    title=f"🎧 {track['title']} (30s)",
+                    title=f"🎧 {preview_tag} {track['title']} ({duration_str})",
                     performer=track["artist"],
                     audio_duration=30,
                     caption=caption,
@@ -627,13 +621,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
 
-    try:
-        await update.inline_query.answer(results, cache_time=15, is_personal=True)
-    except BadRequest as e:
-        logger.warning(
-            f"InlineQueryResultVoice rejected by Telegram ({e}), using audio fallback"
-        )
-        await update.inline_query.answer(fallback_results, cache_time=15, is_personal=True)
+    await update.inline_query.answer(results, cache_time=15, is_personal=True)
 
     # Пакетне збереження метаданих у SQLite виконується у фоні ПІСЛЯ відправки відповіді
     asyncio.get_running_loop().run_in_executor(
@@ -715,6 +703,9 @@ async def _ensure_full_mp3_file_id(
                 except ValueError:
                     upload_chats.append((STORAGE_CHAT_ID, False))
             upload_chats.append((user_id, True))
+            for known_uid in cache.get_known_user_ids():
+                if known_uid != user_id:
+                    upload_chats.append((known_uid, True))
 
             needs_start = False
             for chat_dest, delete_after in upload_chats:
