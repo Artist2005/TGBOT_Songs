@@ -6,6 +6,7 @@
 
 import re
 import time
+import asyncio
 import logging
 from typing import Optional
 from urllib.parse import quote
@@ -17,6 +18,8 @@ DEEZER_SEARCH_URL = "https://api.deezer.com/search/track"
 DEEZER_TRACK_URL = "https://api.deezer.com/track/{track_id}"
 DEEZER_CHART_URL = "https://api.deezer.com/chart/0/tracks"
 DEEZER_ARTIST_TOP_URL = "https://api.deezer.com/artist/{artist_id}/top"
+GENIUS_LYRIC_SEARCH_URL = "https://genius.com/api/search/lyric"
+YOUTUBE_INNERTUBE_SEARCH_URL = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LYRICS_OVH_URL = "https://api.lyrics.ovh/v1/{artist}/{title}"
@@ -97,14 +100,333 @@ def _parse_deezer_item(item: dict) -> Optional[dict]:
     }
 
 
+def _tokenize_words(text: str) -> list[str]:
+    """Розбиває рядок на значущі слова (від 2 символів) для оцінки збігу."""
+    return [w for w in re.findall(r"[\w'’іїєґ]+", text.lower()) if len(w) >= 2]
+
+
+def _direct_overlap_score(query_words: list[str], tracks: list[dict]) -> float:
+    """
+    Оцінює (від 0.0 до 1.0), наскільки прямі результати Deezer збігаються зі словами запиту
+    в назві треку або імені виконавця (ігноруючи сумнівні караоке/fanchants кавери).
+    """
+    if not query_words or not tracks:
+        return 0.0
+
+    best = 0.0
+    for tr in tracks[:3]:
+        artist_l = tr.get("artist", "").lower()
+        title_l = tr.get("title", "").lower()
+        combined = f"{artist_l} {title_l}"
+        if any(
+            bad in combined
+            for bad in ("karaoke", "fanchants", "tribute", "made famous", "8-bit")
+        ):
+            continue
+        matched = sum(1 for w in query_words if w in combined)
+        score = matched / len(query_words)
+        if score > best:
+            best = score
+    return best
+
+
+async def _deezer_search_raw(
+    session: aiohttp.ClientSession, query: str, limit: int = 10
+) -> list[dict]:
+    """Виконує один прямий запит до Deezer Search API."""
+    if not query or not query.strip():
+        return []
+    params = {"q": query.strip(), "limit": min(limit, 25)}
+    try:
+        async with session.get(DEEZER_SEARCH_URL, params=params) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            tracks = []
+            for item in data.get("data", []):
+                parsed = _parse_deezer_item(item)
+                if parsed:
+                    tracks.append(parsed)
+            return tracks
+    except Exception as e:
+        logger.debug(f"Deezer raw search error for '{query}': {e}")
+        return []
+
+
+def _extract_genius_candidates(artist_raw: str, title_raw: str) -> list[tuple[str, str]]:
+    """
+    Перетворює пару (artist_names, title) з Genius на список пар (повний_запит, фолбек_назва)
+    для пошуку у Deezer, враховуючи латинські/кириличні дублі в дужках типу 'Океан Ельзи (Okean Elzy)'.
+    """
+    if not artist_raw or not title_raw:
+        return []
+    art_low = artist_raw.lower()
+    tit_low = title_raw.lower()
+    if (
+        "genius" in art_low
+        or "переклад" in tit_low
+        or "translation" in tit_low
+        or "romanization" in art_low
+    ):
+        return []
+
+    m_art = re.match(r"^([^\(\[]+)\s*\(([^\(\)]+)\)", artist_raw.strip())
+    art_main = (
+        m_art.group(1).strip()
+        if m_art
+        else re.sub(r"\s*[\(\[].*?[\)\]]", "", artist_raw).strip()
+    )
+    art_alt = m_art.group(2).strip() if m_art else ""
+
+    art_parts = [
+        p.strip()
+        for p in re.split(r"\s+(?:ft\.?|feat\.?|&|,)\s+", art_main, flags=re.IGNORECASE)
+        if p.strip()
+    ]
+    art_primary = art_parts[0] if art_parts else art_main
+    art_secondary = art_parts[1] if len(art_parts) > 1 else ""
+    art_alt = re.split(r"\s+(?:ft\.?|feat\.?|&|,)\s+", art_alt, flags=re.IGNORECASE)[0].strip()
+
+    t_main = re.sub(r"\s*[\(\[].*?[\)\]]", "", title_raw).strip() or title_raw.strip()
+    t_main = re.sub(r"\*+$", "", t_main).strip()
+    if not t_main:
+        return []
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for a in (art_primary, art_alt, art_secondary):
+        if a:
+            full_q = f"{a} {t_main}"
+            if full_q.lower() not in seen:
+                seen.add(full_q.lower())
+                out.append((full_q, t_main))
+    return out
+
+
+def _clean_yt_video_candidate(raw_title: str, channel: str = "") -> list[tuple[str, str]]:
+    """Витягує чисту пару (Виконавець Назва, Назва) із заголовка музичного відео YouTube."""
+    if not raw_title:
+        return []
+    t = re.split(r"\s*(?:\||//|#)\s*", raw_title)[0].strip()
+    t = re.sub(
+        r"\s*[\(\[][^)\]]*(?:official|video|audio|lyric|текст|кліп|live|premiere|прем'єра|eurovision|пісня|року|remix|ремікс|cover|кавер|hd|4k|1080p|prod\.?|feat\.?|ft\.?)[^)\]]*[\)\]]",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\s*[\(\[][^)\]]*[\)\]]", "", t)
+    t = re.sub(r"[^\w\s'’іїєґ\-—–&.,!]", " ", t)
+    t = " ".join(t.split()).strip(" -—–.")
+    if not t:
+        return []
+
+    dash_parts = re.split(r"\s+(?:—|–|-)\s+", t, maxsplit=1)
+    if len(dash_parts) == 2:
+        art, song = dash_parts[0].strip(), dash_parts[1].strip()
+        song = re.sub(r"\b(?:19|20)\d{2}\b$", "", song).strip()
+        if art and song:
+            return [(f"{art} {song}", song)]
+
+    clean_ch = re.sub(r"\s*-\s*Topic$", "", channel or "", flags=re.IGNORECASE).strip()
+    if clean_ch and t:
+        return [(f"{clean_ch} {t}", t)]
+    return [(t, t)]
+
+
+async def _fetch_genius_lyric_candidates(
+    session: aiohttp.ClientSession, query: str
+) -> list[tuple[str, str]]:
+    """Шукає пісню за словами з тексту через Genius Lyric Search API."""
+    q_words = _tokenize_words(query)
+    if not q_words:
+        return []
+    try:
+        async with session.get(
+            GENIUS_LYRIC_SEARCH_URL,
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=2.8),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            sections = data.get("response", {}).get("sections", [])
+            hits = sections[0].get("hits", []) if sections else []
+            out: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for h in hits[:5]:
+                res = h.get("result", {})
+                art = res.get("artist_names", "")
+                tit = res.get("title", "")
+                hl = h.get("highlights", [])
+                snippet = " ".join(x.get("value", "") for x in hl)
+                combined_text = f"{art} {tit} {snippet}".lower()
+                matched = sum(1 for w in q_words if w in combined_text)
+                if matched < max(1, (len(q_words) + 1) // 2):
+                    continue
+                for full_q, fallback_t in _extract_genius_candidates(art, tit):
+                    if full_q.lower() not in seen:
+                        seen.add(full_q.lower())
+                        out.append((full_q, fallback_t))
+            return out[:4]
+    except Exception as e:
+        logger.debug(f"Genius lyric search failed for '{query}': {e}")
+        return []
+
+
+async def _fetch_youtube_lyric_candidates(
+    session: aiohttp.ClientSession, query: str
+) -> list[tuple[str, str]]:
+    """Шукає пісню за словами з тексту через швидкий YouTube InnerTube JSON API."""
+    q_search = f"{query} пісня" if not query.isascii() else f"{query} song lyrics"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20240726.00.00",
+                "hl": "uk",
+                "gl": "UA",
+            }
+        },
+        "query": q_search,
+    }
+    try:
+        async with session.post(
+            YOUTUBE_INNERTUBE_SEARCH_URL,
+            json=payload,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=2.8),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            contents = (
+                data.get("contents", {})
+                .get("twoColumnSearchResultsRenderer", {})
+                .get("primaryContents", {})
+                .get("sectionListRenderer", {})
+                .get("contents", [])
+            )
+            out: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            video_count = 0
+            for sec in contents:
+                items = sec.get("itemSectionRenderer", {}).get("contents", [])
+                for it in items:
+                    vr = it.get("videoRenderer")
+                    if not vr:
+                        continue
+                    title = "".join(
+                        x.get("text", "") for x in vr.get("title", {}).get("runs", [])
+                    )
+                    channel = "".join(
+                        x.get("text", "") for x in vr.get("ownerText", {}).get("runs", [])
+                    )
+                    for full_q, fallback_t in _clean_yt_video_candidate(title, channel):
+                        if full_q.lower() not in seen:
+                            seen.add(full_q.lower())
+                            out.append((full_q, fallback_t))
+                    video_count += 1
+                    if video_count >= 3:
+                        break
+                if video_count >= 3:
+                    break
+            return out[:4]
+    except Exception as e:
+        logger.debug(f"YouTube lyric search failed for '{query}': {e}")
+        return []
+
+
+async def _fetch_lrclib_lyric_candidates(
+    session: aiohttp.ClientSession, query: str
+) -> list[tuple[str, str]]:
+    """Додатковий пошук за текстом через LRCLIB (для латинських запитів)."""
+    if not query.isascii():
+        return []
+    try:
+        async with session.get(
+            LRCLIB_SEARCH_URL,
+            params={"q": query},
+            timeout=aiohttp.ClientTimeout(total=2.5),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            items = await resp.json()
+            if not isinstance(items, list):
+                return []
+            out: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for item in items[:3]:
+                art = (item.get("artistName") or "").strip()
+                tit = (item.get("trackName") or "").strip()
+                if art and tit:
+                    full_q = f"{art} {tit}"
+                    if full_q.lower() not in seen:
+                        seen.add(full_q.lower())
+                        out.append((full_q, tit))
+            return out
+    except Exception:
+        return []
+
+
+async def _search_tracks_by_lyrics(
+    session: aiohttp.ClientSession, query: str, limit: int = 10
+) -> list[dict]:
+    """
+    Знаходить треки за словами з пісні (які пам'ятає користувач), паралельно опитуючи
+    YouTube InnerTube, Genius Lyric Search та LRCLIB, а потім резолвить знайдені
+    пісні у повноцінні треки Deezer (з прев'ю, обкладинками та ID).
+    """
+    yt_cands, g_cands, lrc_cands = await asyncio.gather(
+        _fetch_youtube_lyric_candidates(session, query),
+        _fetch_genius_lyric_candidates(session, query),
+        _fetch_lrclib_lyric_candidates(session, query),
+    )
+
+    merged_candidates: list[tuple[str, str]] = []
+    seen_q: set[str] = set()
+    for cand in yt_cands[:2] + g_cands[:3] + lrc_cands[:2] + yt_cands[2:]:
+        full_q, fallback_t = cand
+        if full_q.lower() not in seen_q:
+            seen_q.add(full_q.lower())
+            merged_candidates.append((full_q, fallback_t))
+
+    if not merged_candidates:
+        return []
+
+    async def _resolve_candidate(full_q: str, fallback_t: str) -> list[dict]:
+        res = await _deezer_search_raw(session, full_q, limit=2)
+        if not res and fallback_t and fallback_t.lower() != full_q.lower():
+            res = await _deezer_search_raw(session, fallback_t, limit=2)
+        return res
+
+    resolved_batches = await asyncio.gather(
+        *[_resolve_candidate(fq, ft) for fq, ft in merged_candidates[:4]]
+    )
+
+    tracks: list[dict] = []
+    seen_ids: set[int] = set()
+    for batch in resolved_batches:
+        for tr in batch:
+            tid = int(tr["id"])
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                tracks.append(tr)
+                if len(tracks) >= limit:
+                    return tracks
+    return tracks
+
+
 async def search_tracks(query: str, limit: int = 10) -> list[dict]:
     """
-    Шукає треки через Deezer API з миттєвим поверненням з TTL-кешу при повторних запитах.
+    Шукає треки за назвою, виконавцем АБО за словами з пісні (текстом, який пам'ятає користувач).
+    Використовує комбінацію Deezer API + розпізнавання тексту (Genius + YouTube + LRCLIB) та TTL-кеш.
     """
     if not query or not query.strip():
         return []
 
-    norm_query = " ".join(query.strip().lower().split())
+    clean_q = query.strip()
+    norm_query = " ".join(clean_q.lower().split())
     cache_key = f"{norm_query}:{limit}"
     now = time.monotonic()
 
@@ -112,40 +434,53 @@ async def search_tracks(query: str, limit: int = 10) -> list[dict]:
     if cached and (now - cached[0]) < SEARCH_CACHE_TTL:
         return cached[1]
 
-    params = {
-        "q": query.strip(),
-        "limit": min(limit, 25),
-    }
-
     try:
         session = await _get_session()
-        async with session.get(DEEZER_SEARCH_URL, params=params) as resp:
-            if resp.status != 200:
-                logger.error(f"Deezer API search error: HTTP {resp.status}")
-                return []
+        q_words = _tokenize_words(clean_q)
 
-            data = await resp.json()
-            tracks = []
-            for item in data.get("data", []):
-                parsed = _parse_deezer_item(item)
-                if parsed:
-                    tracks.append(parsed)
+        # Для довгих фраз (4+ слів — майже напевно рядок із тексту пісні) запускаємо паралельно
+        if len(q_words) >= 4:
+            direct_tracks, lyric_tracks = await asyncio.gather(
+                _deezer_search_raw(session, clean_q, limit=limit),
+                _search_tracks_by_lyrics(session, clean_q, limit=limit),
+            )
+            primary = lyric_tracks if lyric_tracks else direct_tracks
+            secondary = direct_tracks if lyric_tracks else []
+        else:
+            # Для 1–3 слів спочатку робимо миттєвий прямий запит до Deezer (~100 мс)
+            direct_tracks = await _deezer_search_raw(session, clean_q, limit=limit)
+            overlap = _direct_overlap_score(q_words, direct_tracks)
+            # Якщо прямий пошук не знайшов точного збігу в назві/виконавці — шукаємо по тексту пісні
+            if len(q_words) >= 2 and (len(direct_tracks) < 2 or overlap < 0.8):
+                lyric_tracks = await _search_tracks_by_lyrics(session, clean_q, limit=limit)
+                primary = lyric_tracks if lyric_tracks else direct_tracks
+                secondary = direct_tracks if lyric_tracks else []
+            else:
+                primary = direct_tracks
+                secondary = []
 
-            if tracks:
-                if len(_search_cache) > 500:
-                    keys = list(_search_cache.keys())[:250]
-                    for k in keys:
-                        _search_cache.pop(k, None)
-                _search_cache[cache_key] = (now, tracks)
+        tracks: list[dict] = []
+        seen_ids: set[int] = set()
+        for tr in primary + secondary:
+            tid = int(tr["id"])
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                tracks.append(tr)
+                if len(tracks) >= limit:
+                    break
 
-            logger.info(f"Found {len(tracks)} tracks for query: '{query}'")
-            return tracks
+        if tracks:
+            if len(_search_cache) > 500:
+                keys = list(_search_cache.keys())[:250]
+                for k in keys:
+                    _search_cache.pop(k, None)
+            _search_cache[cache_key] = (now, tracks)
 
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error during Deezer search: {e}")
-        return []
+        logger.info(f"Found {len(tracks)} tracks for query: '{clean_q}'")
+        return tracks
+
     except Exception as e:
-        logger.error(f"Unexpected error during search: {e}")
+        logger.error(f"Unexpected error during search for '{clean_q}': {e}")
         return []
 
 
