@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 TEMP_PREFIX = "tgbot_dl_"
 YTDLP_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tgbot_ytdlp_cache")
 
+# Окремі пули потоків: важкі завантаження/ефекти не блокують миттєві 30-сек голосові прев'ю
 _executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="music_dl")
+_preview_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="voice_pv")
 
 # Регулярний вираз для підтримуваних музичних/відео платформ
 SUPPORTED_URL_RE = re.compile(
@@ -564,11 +566,11 @@ def _convert_mp3_to_ogg_sync(mp3_bytes: bytes) -> Optional[bytes]:
 
 
 async def convert_preview_to_ogg(mp3_bytes: bytes) -> Optional[bytes]:
-    """Асинхронно конвертує 30-секундне MP3 прев'ю в OGG Opus для Telegram Voice."""
+    """Асинхронно конвертує 30-секундне MP3 прев'ю в OGG Opus в окремому легкому пулі потоків."""
     if not mp3_bytes:
         return None
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _convert_mp3_to_ogg_sync, mp3_bytes)
+    return await loop.run_in_executor(_preview_executor, _convert_mp3_to_ogg_sync, mp3_bytes)
 
 
 def cleanup_file(filepath: str):
@@ -585,8 +587,25 @@ def cleanup_file(filepath: str):
         logger.warning(f"Error cleaning up file {filepath}: {e}")
 
 
-def cleanup_temp_dir():
-    """Очищує залишкові тимчасові папки tgbot_dl_* у системному Temp при старті бота."""
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for fname in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fname))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def cleanup_temp_dir(include_ytdlp_cache: bool = False):
+    """
+    Очищує залишкові тимчасові папки tgbot_dl_* у системному Temp,
+    а також кеш yt-dlp (при ручному очищенні з адмінки або якщо він виріс > 50 МБ).
+    """
     base_temp = tempfile.gettempdir()
     removed = 0
     try:
@@ -596,7 +615,19 @@ def cleanup_temp_dir():
                 if os.path.isdir(full_path):
                     shutil.rmtree(full_path, ignore_errors=True)
                     removed += 1
+
+        if os.path.isdir(YTDLP_CACHE_DIR):
+            if include_ytdlp_cache or _dir_size_bytes(YTDLP_CACHE_DIR) > 50 * 1024 * 1024:
+                shutil.rmtree(YTDLP_CACHE_DIR, ignore_errors=True)
+                removed += 1
+
         if removed:
-            logger.info(f"Cleaned up {removed} leftover temporary directories.")
+            logger.info(f"Cleaned up {removed} temporary/cache directories.")
     except Exception as e:
         logger.warning(f"Failed to scan temp directory during cleanup: {e}")
+
+
+def shutdown_executors():
+    """Коректно завершує пули потоків при зупинці бота."""
+    _executor.shutdown(wait=False, cancel_futures=True)
+    _preview_executor.shutdown(wait=False, cancel_futures=True)

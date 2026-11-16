@@ -14,6 +14,7 @@ import re
 import io
 import html
 import zlib
+import shutil
 import asyncio
 import logging
 import tempfile
@@ -68,6 +69,7 @@ from music_download import (
     convert_preview_to_ogg,
     cleanup_file,
     cleanup_temp_dir,
+    shutdown_executors,
 )
 from cache_db import CacheDB
 
@@ -99,6 +101,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 cache = CacheDB()
 _download_locks: dict[str, asyncio.Lock] = {}
+_user_active_jobs: dict[int, int] = {}
+
+MAX_BOT_DATA_TRACKS = 2000
+MAX_CONCURRENT_JOBS_PER_USER = 3
 
 SILENT_FALLBACK_URL = (
     "https://raw.githubusercontent.com/anars/blank-audio/master/1-second-of-silence.mp3"
@@ -204,6 +210,7 @@ TEXTS = {
         "duration_label": "Тривалість",
         "quality_label": "Якість",
         "invalid_data": "❌ Некоректні дані треку",
+        "rate_limit_busy": "⏳ Зачекайте завершення попередніх завантажень (макс. 3 одночасно)!",
         "cmd_start": "Головне меню та інструкція",
         "cmd_top": "Топ-10 світових хітів",
         "cmd_fav": "Ваші збережені треки (Вибране)",
@@ -294,6 +301,7 @@ TEXTS = {
         "duration_label": "Duration",
         "quality_label": "Quality",
         "invalid_data": "❌ Invalid track data",
+        "rate_limit_busy": "⏳ Please wait for your active downloads to finish (max 3 at once)!",
         "cmd_start": "Main menu & help",
         "cmd_top": "Top 10 global hits",
         "cmd_fav": "Your saved Favorite tracks",
@@ -349,13 +357,51 @@ def _build_lang_keyboard(current_lang: str) -> InlineKeyboardMarkup:
 
 
 def _get_track_lock(key: str | int) -> asyncio.Lock:
-    """Повертає asyncio.Lock для конкретного ключа, уникаючи подвійного завантаження."""
+    """Повертає asyncio.Lock для конкретного ключа, видаляючи лише вільні локи при переповненні."""
     k = str(key)
     if k not in _download_locks:
         if len(_download_locks) > 1000:
-            _download_locks.clear()
+            unlocked = [lk_key for lk_key, lk in _download_locks.items() if not lk.locked()]
+            for lk_key in unlocked[:500]:
+                _download_locks.pop(lk_key, None)
         _download_locks[k] = asyncio.Lock()
     return _download_locks[k]
+
+
+def _store_bot_track(context: ContextTypes.DEFAULT_TYPE, track: dict):
+    """Зберігає метадані треку в bot_data із захистом від безмежного росту RAM."""
+    if not track or "id" not in track:
+        return
+    bd = context.application.bot_data
+    key = str(track["id"])
+    if key not in bd and len(bd) >= MAX_BOT_DATA_TRACKS:
+        for old_k in list(bd.keys())[:500]:
+            bd.pop(old_k, None)
+    bd[key] = track
+
+
+def _try_acquire_user_job(user_id: Optional[int]) -> bool:
+    """Обмежує кількість одночасних важких завантажень/ефектів від одного користувача."""
+    if not user_id:
+        return True
+    uid = int(user_id)
+    active = _user_active_jobs.get(uid, 0)
+    if active >= MAX_CONCURRENT_JOBS_PER_USER:
+        return False
+    _user_active_jobs[uid] = active + 1
+    return True
+
+
+def _release_user_job(user_id: Optional[int]):
+    """Звільняє слот активного завантаження користувача."""
+    if not user_id:
+        return
+    uid = int(user_id)
+    rem = _user_active_jobs.get(uid, 0) - 1
+    if rem <= 0:
+        _user_active_jobs.pop(uid, None)
+    else:
+        _user_active_jobs[uid] = rem
 
 
 async def _resolve_track_meta(
@@ -373,14 +419,14 @@ async def _resolve_track_meta(
 
     db_track = cache.get_track_meta(deezer_id)
     if db_track and db_track.get("title") and db_track["title"] != "Unknown Title":
-        context.application.bot_data[str(deezer_id)] = db_track
+        _store_bot_track(context, db_track)
         return db_track
 
     if deezer_id > 0:
         api_track = await get_track_by_id(deezer_id)
         if api_track:
             cache.save_track_meta(api_track)
-            context.application.bot_data[str(deezer_id)] = api_track
+            _store_bot_track(context, api_track)
             return api_track
 
     return {
@@ -575,7 +621,7 @@ def _build_track_list_buttons(tracks: list[dict], context: ContextTypes.DEFAULT_
     buttons = []
     for idx, track in enumerate(tracks, start=1):
         did = int(track["id"])
-        context.application.bot_data[str(did)] = track
+        _store_bot_track(context, track)
         dur_str = format_duration(track.get("duration", 0))
         is_cached = cache.get_file_id(did) is not None
         prefix = "⚡" if is_cached else "🎤"
@@ -640,7 +686,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     buttons = _build_track_list_buttons(tracks, context)
-    asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, tracks)
+    cache.save_tracks_meta_batch(tracks)
 
     await msg.reply_text(
         t["top_header"],
@@ -754,7 +800,7 @@ async def _handle_direct_url(
             if tracks:
                 track = tracks[0]
                 cache.save_track_meta(track)
-                context.application.bot_data[str(track["id"])] = track
+                _store_bot_track(context, track)
                 try:
                     await status_msg.delete()
                 except Exception:
@@ -795,8 +841,15 @@ async def _handle_direct_url(
         except Exception:
             cache.delete_file_id(synthetic_id)
 
+    if not _try_acquire_user_job(user_id):
+        await msg.reply_text(t["rate_limit_busy"], parse_mode=ParseMode.HTML)
+        return
+
     status_msg = await msg.reply_text(t["url_downloading"], parse_mode=ParseMode.HTML)
-    dl_info = await download_from_url(url)
+    try:
+        dl_info = await download_from_url(url)
+    finally:
+        _release_user_job(user_id)
 
     if not dl_info or not dl_info.get("file_path"):
         try:
@@ -821,7 +874,7 @@ async def _handle_direct_url(
         "preview_url": "",
     }
     cache.save_track_meta(track_meta)
-    context.application.bot_data[str(synthetic_id)] = track_meta
+    _store_bot_track(context, track_meta)
 
     try:
         thumb_bytes = await download_url_bytes(thumb_url) if thumb_url else None
@@ -903,7 +956,7 @@ async def text_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-    asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, tracks)
+    cache.save_tracks_meta_batch(tracks)
 
 
 # === Callback: Відправка 30-секундного голосового прев'ю у чаті ===
@@ -942,7 +995,7 @@ async def preview_callback_handler(update: Update, context: ContextTypes.DEFAULT
         fresh_track = await get_track_by_id(deezer_id)
         if fresh_track:
             cache.save_track_meta(fresh_track)
-            context.application.bot_data[str(deezer_id)] = fresh_track
+            _store_bot_track(context, fresh_track)
             preview_url = fresh_track.get("preview_url")
             if preview_url:
                 mp3_bytes = await download_url_bytes(preview_url)
@@ -1058,7 +1111,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         duration = int(track.get("duration") or 0)
         duration_str = format_duration(duration)
 
-        context.application.bot_data[str(deezer_id)] = track
+        _store_bot_track(context, track)
 
         cached_file_id = cache.get_file_id(deezer_id)
         rank_prefix = f"🔥 #{idx} " if is_chart_query else ""
@@ -1119,9 +1172,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     if not is_fav_query:
-        asyncio.get_running_loop().run_in_executor(
-            None, cache.save_tracks_meta_batch, tracks
-        )
+        cache.save_tracks_meta_batch(tracks)
 
 
 # === Допоміжна функція завантаження та кешування повного MP3 ===
@@ -1210,6 +1261,8 @@ async def _ensure_full_mp3_file_id(
                             logger.warning(f"Direct chat upload failed: {chat_up_err}")
                             break
 
+            # Безпечний список чатів для технічного отримання file_id в інлайні
+            # (НІКОЛИ не надсилаємо в особисті чати сторонніх користувачів!)
             upload_chats = []
             if STORAGE_CHAT_ID:
                 try:
@@ -1217,9 +1270,6 @@ async def _ensure_full_mp3_file_id(
                 except ValueError:
                     upload_chats.append((STORAGE_CHAT_ID, False))
             upload_chats.append((user_id, True))
-            for known_uid in cache.get_known_user_ids():
-                if known_uid != user_id:
-                    upload_chats.append((known_uid, True))
 
             needs_start = False
             for chat_dest, delete_after in upload_chats:
@@ -1306,6 +1356,14 @@ async def _send_or_download_to_chat(
             logger.warning(f"Cached file_id failed in chat {chat_id}, re-downloading: {e}")
             cache.delete_file_id(deezer_id)
 
+    if not _try_acquire_user_job(uid):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=t["rate_limit_busy"],
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     status = await context.bot.send_message(
         chat_id=chat_id,
         text=t["downloading_chat"].format(
@@ -1314,14 +1372,17 @@ async def _send_or_download_to_chat(
         parse_mode=ParseMode.HTML,
     )
 
-    file_id, already_sent, _ = await _ensure_full_mp3_file_id(
-        deezer_id=deezer_id,
-        track=track,
-        user_id=uid,
-        context=context,
-        target_chat_id=chat_id,
-        lang=lang,
-    )
+    try:
+        file_id, already_sent, _ = await _ensure_full_mp3_file_id(
+            deezer_id=deezer_id,
+            track=track,
+            user_id=uid,
+            context=context,
+            target_chat_id=chat_id,
+            lang=lang,
+        )
+    finally:
+        _release_user_job(uid)
 
     try:
         await status.delete()
@@ -1365,162 +1426,171 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     is_inline = callback_query.inline_message_id is not None
     user_id = callback_query.from_user.id
 
+    need_heavy_dl = cache.get_file_id(deezer_id) is None
+    if need_heavy_dl and not _try_acquire_user_job(user_id):
+        await callback_query.answer(t["rate_limit_busy"], show_alert=True)
+        return
+
     await callback_query.answer(t["download_toast"])
 
-    track = await _resolve_track_meta(deezer_id, context)
-    artist = track["artist"]
-    title = track["title"]
-    album = track.get("album", "")
-    duration = int(track.get("duration") or 0)
-    full_caption = _build_full_caption(artist, title, album, duration, lang=lang)
+    try:
+        track = await _resolve_track_meta(deezer_id, context)
+        artist = track["artist"]
+        title = track["title"]
+        album = track.get("album", "")
+        duration = int(track.get("duration") or 0)
+        full_caption = _build_full_caption(artist, title, album, duration, lang=lang)
 
-    logger.info(
-        f"Download request: {artist} - {title} (deezer_id={deezer_id}, inline={is_inline}, lang={lang})"
-    )
+        logger.info(
+            f"Download request: {artist} - {title} (deezer_id={deezer_id}, inline={is_inline}, lang={lang})"
+        )
 
-    loading_caption = t["downloading_inline"].format(
-        artist=html.escape(artist), title=html.escape(title)
-    )
-    if is_inline:
-        try:
-            await context.bot.edit_message_caption(
-                inline_message_id=callback_query.inline_message_id,
-                caption=loading_caption,
-                parse_mode=ParseMode.HTML,
+        loading_caption = t["downloading_inline"].format(
+            artist=html.escape(artist), title=html.escape(title)
+        )
+        if is_inline:
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=callback_query.inline_message_id,
+                    caption=loading_caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.debug(f"Could not update inline caption: {e}")
+        elif callback_query.message and (callback_query.message.voice or callback_query.message.audio):
+            try:
+                await callback_query.message.edit_caption(
+                    caption=loading_caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        # Сценарій 1: Кнопку натиснуто у звичайному чаті з ботом
+        if not is_inline and callback_query.message:
+            chat_id = callback_query.message.chat_id
+            file_id, already_sent, _ = await _ensure_full_mp3_file_id(
+                deezer_id=deezer_id,
+                track=track,
+                user_id=user_id,
+                context=context,
+                target_chat_id=chat_id,
+                lang=lang,
             )
-        except Exception as e:
-            logger.debug(f"Could not update inline caption: {e}")
-    elif callback_query.message and (callback_query.message.voice or callback_query.message.audio):
-        try:
-            await callback_query.message.edit_caption(
-                caption=loading_caption,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
 
-    # Сценарій 1: Кнопку натиснуто у звичайному чаті з ботом
-    if not is_inline and callback_query.message:
-        chat_id = callback_query.message.chat_id
-        file_id, already_sent, _ = await _ensure_full_mp3_file_id(
+            if not file_id:
+                try:
+                    await callback_query.message.edit_caption(
+                        caption=t["download_failed"].format(
+                            artist=html.escape(artist), title=html.escape(title)
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_build_download_keyboard(deezer_id, duration, lang=lang),
+                    )
+                except Exception:
+                    pass
+                return
+
+            if not already_sent:
+                try:
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=file_id,
+                        title=title,
+                        performer=artist,
+                        duration=duration if duration > 0 else None,
+                        caption=full_caption,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_build_track_actions_keyboard(
+                            deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed sending cached audio in chat, clearing cache: {e}")
+                    cache.delete_file_id(deezer_id)
+                    return
+
+            # Видаляємо попереднє голосове прев'ю (але залишаємо меню списку пошуку/чарту, якщо натиснуто звідти)
+            if callback_query.message.voice:
+                try:
+                    await callback_query.message.delete()
+                except Exception:
+                    pass
+            return
+
+        # Сценарій 2: Кнопку натиснуто в Інлайн-повідомленні (@bot у будь-якому чаті)
+        file_id, _, needs_bot_start = await _ensure_full_mp3_file_id(
             deezer_id=deezer_id,
             track=track,
             user_id=user_id,
             context=context,
-            target_chat_id=chat_id,
+            target_chat_id=None,
             lang=lang,
         )
 
         if not file_id:
-            try:
-                await callback_query.message.edit_caption(
-                    caption=t["download_failed"].format(
-                        artist=html.escape(artist), title=html.escape(title)
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_build_download_keyboard(deezer_id, duration, lang=lang),
-                )
-            except Exception:
-                pass
+            if needs_bot_start:
+                bot_username = context.bot.username or (await context.bot.get_me()).username
+                deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
+                try:
+                    await context.bot.edit_message_caption(
+                        inline_message_id=callback_query.inline_message_id,
+                        caption=t["deep_link_prompt"].format(
+                            artist=html.escape(artist), title=html.escape(title)
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
+                        ),
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not set fallback deep-link caption: {e}")
+            else:
+                try:
+                    await context.bot.edit_message_caption(
+                        inline_message_id=callback_query.inline_message_id,
+                        caption=t["download_failed"].format(
+                            artist=html.escape(artist), title=html.escape(title)
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_build_download_keyboard(deezer_id, duration, lang=lang),
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not set inline error caption: {e}")
             return
 
-        if not already_sent:
-            try:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=file_id,
-                    title=title,
-                    performer=artist,
-                    duration=duration if duration > 0 else None,
-                    caption=full_caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_build_track_actions_keyboard(
-                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"Failed sending cached audio in chat, clearing cache: {e}")
-                cache.delete_file_id(deezer_id)
-                return
+        inline_actions_kb = _build_track_actions_keyboard(
+            deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
+        )
 
-        # Видаляємо попереднє голосове прев'ю (але залишаємо меню списку пошуку/чарту, якщо натиснуто звідти)
-        if callback_query.message.voice:
+        for attempt in range(3):
             try:
-                await callback_query.message.delete()
-            except Exception:
-                pass
-        return
-
-    # Сценарій 2: Кнопку натиснуто в Інлайн-повідомленні (@bot у будь-якому чаті)
-    file_id, _, needs_bot_start = await _ensure_full_mp3_file_id(
-        deezer_id=deezer_id,
-        track=track,
-        user_id=user_id,
-        context=context,
-        target_chat_id=None,
-        lang=lang,
-    )
-
-    if not file_id:
-        if needs_bot_start:
-            bot_username = context.bot.username or (await context.bot.get_me()).username
-            deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
-            try:
-                await context.bot.edit_message_caption(
+                await context.bot.edit_message_media(
                     inline_message_id=callback_query.inline_message_id,
-                    caption=t["deep_link_prompt"].format(
-                        artist=html.escape(artist), title=html.escape(title)
+                    media=InputMediaAudio(
+                        media=file_id,
+                        title=title,
+                        performer=artist,
+                        duration=duration if duration > 0 else None,
+                        caption=full_caption,
+                        parse_mode=ParseMode.HTML,
                     ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
-                    ),
+                    reply_markup=inline_actions_kb,
                 )
-            except Exception as e:
-                logger.debug(f"Could not set fallback deep-link caption: {e}")
-        else:
-            try:
-                await context.bot.edit_message_caption(
-                    inline_message_id=callback_query.inline_message_id,
-                    caption=t["download_failed"].format(
-                        artist=html.escape(artist), title=html.escape(title)
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_build_download_keyboard(deezer_id, duration, lang=lang),
-                )
-            except Exception as e:
-                logger.debug(f"Could not set inline error caption: {e}")
-        return
-
-    inline_actions_kb = _build_track_actions_keyboard(
-        deezer_id, user_id=user_id, lang=lang, is_inline=True, artist=artist
-    )
-
-    for attempt in range(3):
-        try:
-            await context.bot.edit_message_media(
-                inline_message_id=callback_query.inline_message_id,
-                media=InputMediaAudio(
-                    media=file_id,
-                    title=title,
-                    performer=artist,
-                    duration=duration if duration > 0 else None,
-                    caption=full_caption,
-                    parse_mode=ParseMode.HTML,
-                ),
-                reply_markup=inline_actions_kb,
-            )
-            break
-        except RetryAfter as ra:
-            await asyncio.sleep(float(ra.retry_after) + 0.5)
-        except (TimedOut, NetworkError) as net_err:
-            logger.warning(f"edit_message_media attempt {attempt + 1} timed out: {net_err}")
-            await asyncio.sleep(1.0)
-        except TelegramError as e:
-            if "Message is not modified" in str(e):
                 break
-            logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
-            break
+            except RetryAfter as ra:
+                await asyncio.sleep(float(ra.retry_after) + 0.5)
+            except (TimedOut, NetworkError) as net_err:
+                logger.warning(f"edit_message_media attempt {attempt + 1} timed out: {net_err}")
+                await asyncio.sleep(1.0)
+            except TelegramError as e:
+                if "Message is not modified" in str(e):
+                    break
+                logger.error(f"Failed to edit inline message media: {e}", exc_info=True)
+                break
+    finally:
+        if need_heavy_dl:
+            _release_user_job(user_id)
 
 
 # === Callback: Додавання / видалення з Вибраного (fav:<deezer_id> або favp:<deezer_id>) ===
@@ -1791,7 +1861,7 @@ async def similar_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     buttons = _build_track_list_buttons(similar, context)
     buttons.append([InlineKeyboardButton(t["btn_close"], callback_data="delmsg")])
-    asyncio.get_running_loop().run_in_executor(None, cache.save_tracks_meta_batch, similar)
+    cache.save_tracks_meta_batch(similar)
 
     if query.message:
         await query.message.reply_text(
@@ -1866,139 +1936,36 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
         effect = parts[1]
         deezer_id = int(parts[2])
         effect_label = EFFECT_LABELS.get(lang, EFFECT_LABELS["uk"]).get(effect, effect)
+
+        need_heavy_fx = cache.get_effect_file_id(deezer_id, effect) is None
+        if need_heavy_fx and not _try_acquire_user_job(user_id):
+            await query.answer(t["rate_limit_busy"], show_alert=True)
+            return
+
         await query.answer(t["effect_loading_toast"].format(effect=effect_label))
 
-        chat_id = query.message.chat_id if query.message else user_id
-        track = await _resolve_track_meta(deezer_id, context)
-        artist = track["artist"]
-        title = track["title"]
-        duration = int(track.get("duration") or 0)
-        fx_title = f"{title} ({effect_label})"
+        try:
+            chat_id = query.message.chat_id if query.message else user_id
+            track = await _resolve_track_meta(deezer_id, context)
+            artist = track["artist"]
+            title = track["title"]
+            duration = int(track.get("duration") or 0)
+            fx_title = f"{title} ({effect_label})"
 
-        # Сценарій А: Інлайн-повідомлення (@ім'я_бота в будь-якому чаті) -> заміна аудіо на місці
-        if is_inline:
-            cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
-            if cached_fx_id:
-                try:
-                    await context.bot.edit_message_media(
-                        inline_message_id=query.inline_message_id,
-                        media=InputMediaAudio(
-                            media=cached_fx_id,
-                            title=fx_title,
-                            performer=artist,
-                            caption=_build_full_caption(
-                                artist, title, "", 0, lang=lang, effect_label=effect_label
-                            ),
-                            parse_mode=ParseMode.HTML,
-                        ),
-                        reply_markup=_build_track_actions_keyboard(
-                            deezer_id,
-                            user_id=user_id,
-                            lang=lang,
-                            is_inline=True,
-                            artist=artist,
-                            show_original_btn=True,
-                            duration=duration,
-                        ),
-                    )
-                    return
-                except Exception:
-                    pass
-
-            try:
-                await context.bot.edit_message_caption(
-                    inline_message_id=query.inline_message_id,
-                    caption=t["effect_processing"].format(
-                        effect=html.escape(effect_label),
-                        artist=html.escape(artist),
-                        title=html.escape(title),
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-
-            lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
-            async with lock:
-                base_path = None
-                fx_path = None
-                temp_dl_dir = None
-                try:
-                    base_file_id = cache.get_file_id(deezer_id)
-                    if base_file_id:
-                        try:
-                            tg_file = await context.bot.get_file(base_file_id)
-                            temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
-                            candidate_path = os.path.join(temp_dl_dir, "base.mp3")
-                            await tg_file.download_to_drive(custom_path=candidate_path)
-                            if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
-                                base_path = candidate_path
-                        except Exception:
-                            pass
-
-                    if not base_path:
-                        base_path = await download_track(artist, title, target_duration=duration)
-
-                    if not base_path or not os.path.exists(base_path):
-                        return
-
-                    fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
-                    if not fx_res:
-                        return
-
-                    fx_path, new_duration = fx_res
-                    caption = _build_full_caption(
-                        artist, title, "", new_duration, lang=lang, effect_label=effect_label
-                    )
-
-                    upload_chats = []
-                    if STORAGE_CHAT_ID:
-                        try:
-                            upload_chats.append((int(STORAGE_CHAT_ID), False))
-                        except ValueError:
-                            upload_chats.append((STORAGE_CHAT_ID, False))
-                    upload_chats.append((user_id, True))
-                    for known_uid in cache.get_known_user_ids():
-                        if known_uid != user_id:
-                            upload_chats.append((known_uid, True))
-
-                    fx_file_id = None
-                    for chat_dest, delete_after in upload_chats:
-                        try:
-                            with open(fx_path, "rb") as audio_f:
-                                sent = await context.bot.send_audio(
-                                    chat_id=chat_dest,
-                                    audio=audio_f,
-                                    title=fx_title,
-                                    performer=artist,
-                                    duration=new_duration if new_duration > 0 else None,
-                                    caption=caption,
-                                    parse_mode=ParseMode.HTML,
-                                    disable_notification=True,
-                                    read_timeout=120,
-                                    write_timeout=120,
-                                )
-                                if sent and sent.audio:
-                                    fx_file_id = sent.audio.file_id
-                                    cache.save_effect_file_id(deezer_id, effect, fx_file_id)
-                                    if delete_after:
-                                        try:
-                                            await sent.delete()
-                                        except Exception:
-                                            pass
-                                    break
-                        except Exception:
-                            continue
-
-                    if fx_file_id:
+            # Сценарій А: Інлайн-повідомлення (@ім'я_бота в будь-якому чаті) -> заміна аудіо на місці
+            if is_inline:
+                cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
+                if cached_fx_id:
+                    try:
                         await context.bot.edit_message_media(
                             inline_message_id=query.inline_message_id,
                             media=InputMediaAudio(
-                                media=fx_file_id,
+                                media=cached_fx_id,
                                 title=fx_title,
                                 performer=artist,
-                                duration=new_duration if new_duration > 0 else None,
-                                caption=caption,
+                                caption=_build_full_caption(
+                                    artist, title, "", 0, lang=lang, effect_label=effect_label
+                                ),
                                 parse_mode=ParseMode.HTML,
                             ),
                             reply_markup=_build_track_actions_keyboard(
@@ -2011,125 +1978,275 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
                                 duration=duration,
                             ),
                         )
+                        return
+                    except Exception:
+                        cache.delete_effect_file_id(deezer_id, effect)
+
+                try:
+                    await context.bot.edit_message_caption(
+                        inline_message_id=query.inline_message_id,
+                        caption=t["effect_processing"].format(
+                            effect=html.escape(effect_label),
+                            artist=html.escape(artist),
+                            title=html.escape(title),
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+                lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
+                async with lock:
+                    base_path = None
+                    fx_path = None
+                    temp_dl_dir = None
+                    try:
+                        base_file_id = cache.get_file_id(deezer_id)
+                        if base_file_id:
+                            try:
+                                tg_file = await context.bot.get_file(base_file_id)
+                                temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
+                                candidate_path = os.path.join(temp_dl_dir, "base.mp3")
+                                await tg_file.download_to_drive(custom_path=candidate_path)
+                                if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
+                                    base_path = candidate_path
+                            except Exception:
+                                pass
+
+                        if not base_path:
+                            base_path = await download_track(artist, title, target_duration=duration)
+
+                        if not base_path or not os.path.exists(base_path):
+                            return
+
+                        fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
+                        if not fx_res:
+                            return
+
+                        fx_path, new_duration = fx_res
+                        caption = _build_full_caption(
+                            artist, title, "", new_duration, lang=lang, effect_label=effect_label
+                        )
+
+                        upload_chats = []
+                        if STORAGE_CHAT_ID:
+                            try:
+                                upload_chats.append((int(STORAGE_CHAT_ID), False))
+                            except ValueError:
+                                upload_chats.append((STORAGE_CHAT_ID, False))
+                        upload_chats.append((user_id, True))
+
+                        fx_file_id = None
+                        needs_start = False
+                        for chat_dest, delete_after in upload_chats:
+                            upload_lock = _get_track_lock(f"upload:{chat_dest}")
+                            async with upload_lock:
+                                for attempt in range(3):
+                                    try:
+                                        with open(fx_path, "rb") as audio_f:
+                                            sent = await context.bot.send_audio(
+                                                chat_id=chat_dest,
+                                                audio=audio_f,
+                                                title=fx_title,
+                                                performer=artist,
+                                                duration=new_duration if new_duration > 0 else None,
+                                                caption=caption,
+                                                parse_mode=ParseMode.HTML,
+                                                disable_notification=True,
+                                                read_timeout=120,
+                                                write_timeout=120,
+                                            )
+                                            if sent and sent.audio:
+                                                fx_file_id = sent.audio.file_id
+                                                cache.save_effect_file_id(deezer_id, effect, fx_file_id)
+                                                if delete_after:
+                                                    try:
+                                                        await sent.delete()
+                                                    except Exception:
+                                                        pass
+                                                break
+                                    except Forbidden:
+                                        needs_start = True
+                                        break
+                                    except RetryAfter as ra:
+                                        await asyncio.sleep(float(ra.retry_after) + 0.5)
+                                    except (TimedOut, NetworkError):
+                                        await asyncio.sleep(1.0)
+                                    except Exception:
+                                        break
+                            if fx_file_id:
+                                break
+
+                        if fx_file_id:
+                            for attempt in range(3):
+                                try:
+                                    await context.bot.edit_message_media(
+                                        inline_message_id=query.inline_message_id,
+                                        media=InputMediaAudio(
+                                            media=fx_file_id,
+                                            title=fx_title,
+                                            performer=artist,
+                                            duration=new_duration if new_duration > 0 else None,
+                                            caption=caption,
+                                            parse_mode=ParseMode.HTML,
+                                        ),
+                                        reply_markup=_build_track_actions_keyboard(
+                                            deezer_id,
+                                            user_id=user_id,
+                                            lang=lang,
+                                            is_inline=True,
+                                            artist=artist,
+                                            show_original_btn=True,
+                                            duration=duration,
+                                        ),
+                                    )
+                                    break
+                                except RetryAfter as ra:
+                                    await asyncio.sleep(float(ra.retry_after) + 0.5)
+                                except (TimedOut, NetworkError):
+                                    await asyncio.sleep(1.0)
+                                except TelegramError:
+                                    break
+                        elif needs_start:
+                            bot_username = context.bot.username or (await context.bot.get_me()).username
+                            deep_link = f"https://t.me/{bot_username}?start=track_{deezer_id}"
+                            try:
+                                await context.bot.edit_message_caption(
+                                    inline_message_id=query.inline_message_id,
+                                    caption=t["deep_link_prompt"].format(
+                                        artist=html.escape(artist), title=html.escape(title)
+                                    ),
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=InlineKeyboardMarkup(
+                                        [[InlineKeyboardButton(t["btn_open_download"], url=deep_link)]]
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                    finally:
+                        if base_path:
+                            cleanup_file(base_path)
+                        if fx_path:
+                            cleanup_file(fx_path)
+                        if temp_dl_dir and os.path.exists(temp_dl_dir):
+                            shutil.rmtree(temp_dl_dir, ignore_errors=True)
+                return
+
+            # Сценарій Б: Звичайний чат з ботом
+            if query.message:
+                try:
+                    await query.message.edit_reply_markup(
+                        reply_markup=_build_track_actions_keyboard(
+                            deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                        )
+                    )
+                except Exception:
+                    pass
+
+            # 1. Миттєва перевірка кешу ефекту
+            cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
+            if cached_fx_id:
+                try:
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=cached_fx_id,
+                        caption=_build_full_caption(
+                            artist, title, "", 0, lang=lang, effect_label=effect_label
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_build_track_actions_keyboard(
+                            deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                        ),
+                    )
+                    return
+                except Exception:
+                    cache.delete_effect_file_id(deezer_id, effect)
+
+            status_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=t["effect_processing"].format(
+                    effect=html.escape(effect_label),
+                    artist=html.escape(artist),
+                    title=html.escape(title),
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+            lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
+            async with lock:
+                base_path = None
+                fx_path = None
+                temp_dl_dir = None
+                try:
+                    # Спочатку пробуємо швидко завантажити базовий MP3 із Telegram file_id (до 20 МБ)
+                    base_file_id = cache.get_file_id(deezer_id)
+                    if base_file_id:
+                        try:
+                            tg_file = await context.bot.get_file(base_file_id)
+                            temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
+                            candidate_path = os.path.join(temp_dl_dir, "base.mp3")
+                            await tg_file.download_to_drive(custom_path=candidate_path)
+                            if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
+                                base_path = candidate_path
+                        except Exception as e:
+                            logger.debug(f"Could not fetch base file from Telegram, re-downloading: {e}")
+
+                    if not base_path:
+                        base_path = await download_track(artist, title, target_duration=duration)
+
+                    if not base_path or not os.path.exists(base_path):
+                        await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                        return
+
+                    fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
+                    if not fx_res:
+                        await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                        return
+
+                    fx_path, new_duration = fx_res
+                    caption = _build_full_caption(
+                        artist, title, "", new_duration, lang=lang, effect_label=effect_label
+                    )
+                    upload_lock = _get_track_lock(f"upload:{chat_id}")
+                    async with upload_lock:
+                        with open(fx_path, "rb") as audio_f:
+                            sent = await context.bot.send_audio(
+                                chat_id=chat_id,
+                                audio=audio_f,
+                                title=fx_title,
+                                performer=artist,
+                                duration=new_duration if new_duration > 0 else None,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=_build_track_actions_keyboard(
+                                    deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
+                                ),
+                                read_timeout=120,
+                                write_timeout=120,
+                            )
+                            if sent and sent.audio:
+                                cache.save_effect_file_id(deezer_id, effect, sent.audio.file_id)
+
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error(f"Error creating audio effect {effect}: {e}")
+                    try:
+                        await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
                 finally:
                     if base_path:
                         cleanup_file(base_path)
                     if fx_path:
                         cleanup_file(fx_path)
                     if temp_dl_dir and os.path.exists(temp_dl_dir):
-                        cleanup_file(os.path.join(temp_dl_dir, "base.mp3"))
-            return
-
-        # Сценарій Б: Звичайний чат з ботом
-        if query.message:
-            try:
-                await query.message.edit_reply_markup(
-                    reply_markup=_build_track_actions_keyboard(
-                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
-                    )
-                )
-            except Exception:
-                pass
-
-        # 1. Миттєва перевірка кешу ефекту
-        cached_fx_id = cache.get_effect_file_id(deezer_id, effect)
-        if cached_fx_id:
-            try:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=cached_fx_id,
-                    caption=_build_full_caption(
-                        artist, title, "", 0, lang=lang, effect_label=effect_label
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_build_track_actions_keyboard(
-                        deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
-                    ),
-                )
-                return
-            except Exception:
-                pass
-
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=t["effect_processing"].format(
-                effect=html.escape(effect_label),
-                artist=html.escape(artist),
-                title=html.escape(title),
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-        lock = _get_track_lock(f"fx:{deezer_id}:{effect}")
-        async with lock:
-            base_path = None
-            fx_path = None
-            temp_dl_dir = None
-            try:
-                # Спочатку пробуємо швидко завантажити базовий MP3 із Telegram file_id (до 20 МБ)
-                base_file_id = cache.get_file_id(deezer_id)
-                if base_file_id:
-                    try:
-                        tg_file = await context.bot.get_file(base_file_id)
-                        temp_dl_dir = tempfile.mkdtemp(prefix="tgbot_dl_")
-                        candidate_path = os.path.join(temp_dl_dir, "base.mp3")
-                        await tg_file.download_to_drive(custom_path=candidate_path)
-                        if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 20_000:
-                            base_path = candidate_path
-                    except Exception as e:
-                        logger.debug(f"Could not fetch base file from Telegram, re-downloading: {e}")
-
-                if not base_path:
-                    base_path = await download_track(artist, title, target_duration=duration)
-
-                if not base_path or not os.path.exists(base_path):
-                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
-                    return
-
-                fx_res = await apply_audio_effect(base_path, effect, base_duration=duration)
-                if not fx_res:
-                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
-                    return
-
-                fx_path, new_duration = fx_res
-                caption = _build_full_caption(
-                    artist, title, "", new_duration, lang=lang, effect_label=effect_label
-                )
-                with open(fx_path, "rb") as audio_f:
-                    sent = await context.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_f,
-                        title=fx_title,
-                        performer=artist,
-                        duration=new_duration if new_duration > 0 else None,
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=_build_track_actions_keyboard(
-                            deezer_id, user_id=user_id, lang=lang, is_inline=False, artist=artist
-                        ),
-                        read_timeout=120,
-                        write_timeout=120,
-                    )
-                    if sent and sent.audio:
-                        cache.save_effect_file_id(deezer_id, effect, sent.audio.file_id)
-
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error(f"Error creating audio effect {effect}: {e}")
-                try:
-                    await status_msg.edit_text(t["effect_failed"], parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-            finally:
-                if base_path:
-                    cleanup_file(base_path)
-                if fx_path:
-                    cleanup_file(fx_path)
-                if temp_dl_dir and os.path.exists(temp_dl_dir):
-                    cleanup_file(os.path.join(temp_dl_dir, "base.mp3"))
+                        shutil.rmtree(temp_dl_dir, ignore_errors=True)
+        finally:
+            if need_heavy_fx:
+                _release_user_job(user_id)
 
 
 # === Адмін-панель (/admin або /stats) — виключно для власника бота ===
@@ -2210,8 +2327,8 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     lang = _get_lang(query.from_user)
     if query.data == "adm:cleantmp":
-        cleanup_temp_dir()
-        await query.answer("🧹 Тимчасові папки очищено!" if lang == "uk" else "🧹 Temp folders cleaned!")
+        cleanup_temp_dir(include_ytdlp_cache=True)
+        await query.answer("🧹 Тимчасові папки та кеш очищено!" if lang == "uk" else "🧹 Temp & cache folders cleaned!")
     else:
         await query.answer("🔄 Оновлено" if lang == "uk" else "🔄 Refreshed")
 
@@ -2254,8 +2371,10 @@ async def post_init(application: Application):
 
 
 async def post_shutdown(application: Application):
-    """Коректне закриття HTTP-сесії при зупинці бота."""
+    """Коректне закриття HTTP-сесії, пулів потоків та SQLite при зупинці бота."""
     await close_session()
+    shutdown_executors()
+    cache.close()
 
 
 # === Main Application Entry Point ===
@@ -2306,17 +2425,14 @@ def main():
 
     app.run_polling(
         drop_pending_updates=True,
+        bootstrap_retries=5,
         allowed_updates=["message", "inline_query", "callback_query"],
         close_loop=False,
     )
 
 
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     try:
         main()

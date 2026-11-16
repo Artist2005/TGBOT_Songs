@@ -30,10 +30,19 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=6, connect=3)
 # In-memory TTL-кеші
 SEARCH_CACHE_TTL = 180  # 3 хвилини
 CHART_CACHE_TTL = 600   # 10 хвилин
+MAX_LYRICS_CACHE = 300
 
 _search_cache: dict[str, tuple[float, list[dict]]] = {}
 _chart_cache: Optional[tuple[float, list[dict]]] = None
 _lyrics_cache: dict[str, str] = {}
+
+
+def _put_lyrics_cache(cache_key: str, lyrics: str):
+    """Зберігає текст пісні в RAM із захистом від безмежного росту пам'яті."""
+    if cache_key not in _lyrics_cache and len(_lyrics_cache) >= MAX_LYRICS_CACHE:
+        for old_k in list(_lyrics_cache.keys())[:75]:
+            _lyrics_cache.pop(old_k, None)
+    _lyrics_cache[cache_key] = lyrics
 
 _session: Optional[aiohttp.ClientSession] = None
 
@@ -571,9 +580,11 @@ async def get_similar_tracks(
         except Exception as e:
             logger.debug(f"Artist top lookup failed for {artist_id}: {e}")
 
-    if len(candidates) < limit and artist:
-        searched = await search_tracks(artist, limit=limit + 6)
-        candidates.extend(searched)
+    if len(candidates) < limit:
+        fallback_q = artist if (artist and artist != "Unknown Artist") else title
+        if fallback_q:
+            searched = await search_tracks(fallback_q, limit=limit + 6)
+            candidates.extend(searched)
 
     results: list[dict] = []
     seen_ids = {int(deezer_id)}
@@ -592,6 +603,9 @@ async def get_similar_tracks(
             break
 
     if results:
+        if len(_search_cache) > 500:
+            for k in list(_search_cache.keys())[:250]:
+                _search_cache.pop(k, None)
         _search_cache[cache_key] = (now, results)
     return results
 
@@ -698,7 +712,7 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
                     lyrics = (data.get("plainLyrics") or "").strip()
                     if lyrics:
                         lyrics = re.sub(r"\n{3,}", "\n\n", lyrics)
-                        _lyrics_cache[cache_key] = lyrics
+                        _put_lyrics_cache(cache_key, lyrics)
                         return lyrics
         except Exception as e:
             logger.debug(f"LRCLIB direct get failed: {e}")
@@ -706,7 +720,7 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
     # 2. Швидкий пошук через NetEase Music API (працює і для українських/кириличних, і для світових пісень)
     netease_res = await _fetch_netease_lyrics(session, clean_artist, clean_title)
     if netease_res:
-        _lyrics_cache[cache_key] = netease_res
+        _put_lyrics_cache(cache_key, netease_res)
         return netease_res
 
     # 3. Пошук через LRCLIB /api/search (якщо запит латиницею)
@@ -721,7 +735,7 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
                             lyrics = (item.get("plainLyrics") or "").strip()
                             if lyrics:
                                 lyrics = re.sub(r"\n{3,}", "\n\n", lyrics)
-                                _lyrics_cache[cache_key] = lyrics
+                                _put_lyrics_cache(cache_key, lyrics)
                                 return lyrics
         except Exception as e:
             logger.debug(f"LRCLIB search failed: {e}")
@@ -739,7 +753,7 @@ async def get_track_lyrics(artist: str, title: str) -> Optional[str]:
                     if lyrics:
                         lyrics = re.sub(r"\r\n", "\n", lyrics)
                         lyrics = re.sub(r"\n{3,}", "\n\n", lyrics)
-                        _lyrics_cache[cache_key] = lyrics
+                        _put_lyrics_cache(cache_key, lyrics)
                         return lyrics
         except Exception as e:
             logger.debug(f"lyrics.ovh fallback failed: {e}")
@@ -780,7 +794,7 @@ async def resolve_spotify_query(url: str) -> Optional[str]:
 
 
 async def download_url_bytes(url: str, max_bytes: int = 10 * 1024 * 1024) -> Optional[bytes]:
-    """Завантажує байти за URL (для обкладинки альбому або 30-сек прев'ю)."""
+    """Безпечно завантажує байти за URL по частинах із раннім відсіканням при перевищенні ліміту."""
     if not url:
         return None
     try:
@@ -788,10 +802,14 @@ async def download_url_bytes(url: str, max_bytes: int = 10 * 1024 * 1024) -> Opt
         async with session.get(url) as resp:
             if resp.status != 200:
                 return None
-            content = await resp.read()
-            if len(content) > max_bytes:
+            if resp.content_length and resp.content_length > max_bytes:
                 return None
-            return content
+            chunks = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                chunks.extend(chunk)
+                if len(chunks) > max_bytes:
+                    return None
+            return bytes(chunks)
     except Exception as e:
         logger.debug(f"Could not download bytes from {url}: {e}")
         return None
