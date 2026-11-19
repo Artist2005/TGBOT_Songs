@@ -1,12 +1,12 @@
 """
-Telegram Inline Music Bot (UA / EN).
-Швидкий пошук та завантаження MP3 у будь-якому чаті (Inline + Direct Chat):
-- Чарти при порожньому @bot та /top
-- Завантаження за посиланнями (YouTube, Shorts, SoundCloud, TikTok, Reels, Spotify)
-- Вибране / власний плейлист (❤️ + /favorites + @bot fav)
-- Тексти пісень (📜 Текст у згортаному блоці)
-- Аудіо-ефекти в 1 клік (🌙 Slowed + Reverb, ⚡ Speed Up, 🔊 Bass Boost)
-- Схожі треки (📻 Схожі)
+Telegram Inline Music Bot (English UI).
+Fast search, 30s previews, and full MP3 downloads in any chat (Inline + Direct Chat):
+- Top Chart on empty @bot query and /top
+- Direct link downloads (YouTube, Shorts, SoundCloud, TikTok, Reels, Spotify)
+- Favorites playlist (❤️ + /favorites + @bot fav)
+- Song lyrics (📜 Lyrics with clean pagination)
+- 1-click audio effects (🌙 Slowed + Reverb, ⚡ Speed Up, 🔊 Bass Boost)
+- Similar tracks (📻 Similar)
 """
 
 import os
@@ -111,11 +111,6 @@ SILENT_FALLBACK_URL = (
 )
 
 EFFECT_LABELS = {
-    "uk": {
-        "slowed": "🌙 Slowed + Reverb",
-        "speedup": "⚡ Speed Up",
-        "bass": "🔊 Bass Boost",
-    },
     "en": {
         "slowed": "🌙 Slowed + Reverb",
         "speedup": "⚡ Speed Up",
@@ -123,99 +118,8 @@ EFFECT_LABELS = {
     },
 }
 
-# === Двомовні тексти (Українська / English) ===
+# === English UI Texts ===
 TEXTS = {
-    "uk": {
-        "welcome": (
-            "🎵 <b>Вітаємо у Music Explorer Bot!</b>\n\n"
-            "Шукайте, слухайте 30-секундні уривки та завантажуйте повні MP3 у будь-якому чаті!\n\n"
-            "✨ <b>Можливості:</b>\n"
-            "• <b>Інлайн у будь-якому чаті:</b> введіть <code>@{bot_name} назва або слова з пісні</code> (або просто <code>@{bot_name} </code> для Топ-чарту)\n"
-            "• <b>Пошук за назвою чи словами:</b> напишіть назву, виконавця або просто рядок із пісні, який пам'ятаєте\n"
-            "• <b>Посилання:</b> надішліть лінк із <b>YouTube, Shorts, TikTok, SoundCloud, Reels</b> або <b>Spotify</b> — бот миттєво витягне MP3\n"
-            "• <b>Під кожним треком:</b> ❤️ Вибране • 📜 Текст • 🎛 Ефекти (Slowed / Speed Up / Bass) • 📻 Схожі\n\n"
-            "📌 <b>Команди:</b> /top — Хіти • /favorites — Вибране • /lang — Мова"
-        ),
-        "lang_prompt": "🌐 <b>Оберіть мову інтерфейсу / Choose language:</b>",
-        "lang_changed": "✅ <b>Мову змінено на Українську!</b>",
-        "searching": "🔍 Шукаю: <b>{query}</b>...",
-        "no_results_chat": "😔 Нічого не знайдено за запитом: <b>{query}</b>",
-        "search_results_header": (
-            "🎧 <b>Результати для:</b> <code>{query}</code>\n"
-            "<i>Оберіть трек (⚡ — миттєво з кешу, 🎤 — 30 сек прев'ю):</i>"
-        ),
-        "top_header": (
-            "🔥 <b>Топ-10 світових хітів зараз:</b>\n"
-            "<i>Натисніть на трек, щоб прослухати або завантажити:</i>"
-        ),
-        "fav_header": (
-            "❤️ <b>Ваш плейлист «Вибране» ({count}):</b>\n"
-            "<i>Також доступний у будь-якому чаті через</i> <code>@{bot_name} fav</code>"
-        ),
-        "fav_empty": (
-            "🤍 <b>У вашому «Вибраному» поки порожньо.</b>\n"
-            "Натисніть <b>🤍</b> під будь-яким завантаженим треком, щоб зберегти його сюди!"
-        ),
-        "fav_added_toast": "❤️ Додано у Вибране (/favorites)",
-        "fav_removed_toast": "💔 Видалено з Вибраного",
-        "fav_inline_btn": "❤️ Моє вибране ({count})",
-        "similar_header": "📻 <b>Схожі треки та хіти {artist}:</b>",
-        "similar_empty": "😔 Не знайдено схожих треків.",
-        "lyrics_header": "📜 <b>{artist} — {title}</b>",
-        "lyrics_not_found": "😔 Текст для <b>{artist} — {title}</b> не знайдено.",
-        "lyrics_loading_toast": "📜 Шукаю текст пісні...",
-        "effect_loading_toast": "🎛 Створюю версію {effect}...",
-        "effect_processing": "🎛 Обробляю <b>{effect}</b>:\n🎵 <b>{artist} — {title}</b>...",
-        "effect_failed": "❌ Не вдалося обробити аудіо-ефект.",
-        "url_downloading": "🔗 Завантажую аудіо за посиланням...",
-        "url_failed": "❌ Не вдалося завантажити аудіо за цим посиланням.",
-        "preview_toast": "🎤 Надсилаю 30-секундне прев'ю...",
-        "no_preview_available": (
-            "🎵 <b>{artist} — {title}</b>\n"
-            "<i>Прев'ю недоступне. Натисніть нижче, щоб завантажити повний MP3:</i>"
-        ),
-        "no_results_inline_title": "❌ Нічого не знайдено",
-        "no_results_inline_desc": "Не знайдено треків за запитом '{query}'",
-        "no_results_inline_msg": "🔍 <b>Нічого не знайдено за запитом:</b> <code>{query}</code>",
-        "downloading_chat": "⏳ Завантажую повний MP3:\n🎵 <b>{artist} — {title}</b>",
-        "download_failed": "❌ <b>Не вдалося завантажити трек:</b>\n🎵 {artist} — {title}",
-        "download_toast": "⏳ Завантажую повний MP3 (192 kbps)...",
-        "downloading_inline": (
-            "⏳ <b>Завантажую повний MP3...</b>\n"
-            "🎵 <b>{artist} — {title}</b>"
-        ),
-        "deep_link_prompt": (
-            "⚠️ <b>Для першого завантаження відкрийте бота один раз:</b>\n"
-            "🎵 <b>{artist} — {title}</b>\n\n"
-            "👇 Натисніть кнопку нижче — трек надішлеться автоматично:"
-        ),
-        "ready_fallback": (
-            "✅ <b>Повний MP3 готовий!</b>\n"
-            "📩 Трек надіслано вам у @{bot_name} (або натисніть кнопку нижче, щоб забрати його):"
-        ),
-        "btn_download": "📥 Скачати MP3",
-        "btn_original": "💿 Оригінал",
-        "btn_open_download": "📥 Відкрити бота і забрати MP3",
-        "btn_top": "🔥 Топ-чарт",
-        "btn_favorites": "❤️ Вибране",
-        "btn_fav_add": "🤍 Вибране",
-        "btn_fav_saved": "❤️ Вибране",
-        "btn_lyrics": "📜 Текст",
-        "btn_hide_lyrics": "🔙 Сховати текст",
-        "btn_effects": "🎛 Ефекти",
-        "btn_similar": "📻 Схожі",
-        "btn_back": "🔙 Назад",
-        "btn_close": "✖️ Закрити",
-        "album_label": "Альбом",
-        "duration_label": "Тривалість",
-        "quality_label": "Якість",
-        "invalid_data": "❌ Некоректні дані треку",
-        "rate_limit_busy": "⏳ Зачекайте завершення попередніх завантажень (макс. 3 одночасно)!",
-        "cmd_start": "Головне меню та інструкція",
-        "cmd_top": "Топ-10 світових хітів",
-        "cmd_fav": "Ваші збережені треки (Вибране)",
-        "cmd_lang": "Змінити мову (🇺🇦 / 🇬🇧)",
-    },
     "en": {
         "welcome": (
             "🎵 <b>Welcome to Music Explorer Bot!</b>\n\n"
@@ -225,10 +129,8 @@ TEXTS = {
             "• <b>Search by title or lyrics:</b> send a song title, artist name, or any words you remember from the lyrics\n"
             "• <b>Direct Links:</b> send a link from <b>YouTube, Shorts, TikTok, SoundCloud, Reels</b> or <b>Spotify</b> to get MP3\n"
             "• <b>Under every track:</b> ❤️ Favorites • 📜 Lyrics • 🎛 Effects (Slowed / Speed Up / Bass) • 📻 Similar\n\n"
-            "📌 <b>Commands:</b> /top — Top Chart • /favorites — Favorites • /lang — Language"
+            "📌 <b>Commands:</b> /top — Top Chart • /favorites — Favorites"
         ),
-        "lang_prompt": "🌐 <b>Choose interface language / Оберіть мову:</b>",
-        "lang_changed": "✅ <b>Language set to English!</b>",
         "searching": "🔍 Searching: <b>{query}</b>...",
         "no_results_chat": "😔 No results found for: <b>{query}</b>",
         "search_results_header": (
@@ -245,7 +147,7 @@ TEXTS = {
         ),
         "fav_empty": (
             "🤍 <b>Your Favorites playlist is empty.</b>\n"
-            "Tap <b>🤍</b> under any downloaded track to save it here!"
+            "Tap <b>🤍 Favorite</b> under any track to save it here!"
         ),
         "fav_added_toast": "❤️ Added to Favorites (/favorites)",
         "fav_removed_toast": "💔 Removed from Favorites",
@@ -305,53 +207,26 @@ TEXTS = {
         "cmd_start": "Main menu & help",
         "cmd_top": "Top 10 global hits",
         "cmd_fav": "Your saved Favorite tracks",
-        "cmd_lang": "Switch language (🇺🇦 / 🇬🇧)",
     },
 }
 
 
 def _get_lang(user: Optional[User]) -> str:
-    """Визначає мову користувача з RAM-кешу або за Telegram language_code."""
-    if not user:
-        return "uk"
-    saved = cache.get_user_lang(user.id)
-    if saved in ("uk", "en"):
-        return saved
-    code = (user.language_code or "").lower()
-    if code.startswith("en"):
-        return "en"
-    return "uk"
+    """Повертає мову інтерфейсу (завжди English) та реєструє нових користувачів у статистиці."""
+    if user and cache.get_user_lang(user.id) is None:
+        cache.set_user_lang(user.id, "en")
+    return "en"
 
 
-def _build_welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
-    """Компактне меню швидких дій та перемикання мови для /start."""
-    t = TEXTS.get(lang, TEXTS["uk"])
-    uk_label = "🇺🇦 Українська ✓" if lang == "uk" else "🇺🇦 Українська"
-    en_label = "🇬🇧 English ✓" if lang == "en" else "🇬🇧 English"
+def _build_welcome_keyboard(lang: str = "en") -> InlineKeyboardMarkup:
+    """Компактне меню швидких дій для /start."""
+    t = TEXTS["en"]
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(t["btn_top"], callback_data="nav:top"),
                 InlineKeyboardButton(t["btn_favorites"], callback_data="nav:fav"),
             ],
-            [
-                InlineKeyboardButton(uk_label, callback_data="lang:uk"),
-                InlineKeyboardButton(en_label, callback_data="lang:en"),
-            ],
-        ]
-    )
-
-
-def _build_lang_keyboard(current_lang: str) -> InlineKeyboardMarkup:
-    """Клавіатура перемикання мови."""
-    uk_label = "🇺🇦 Українська ✓" if current_lang == "uk" else "🇺🇦 Українська"
-    en_label = "🇬🇧 English ✓" if current_lang == "en" else "🇬🇧 English"
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(uk_label, callback_data="lang:uk"),
-                InlineKeyboardButton(en_label, callback_data="lang:en"),
-            ]
         ]
     )
 
@@ -459,11 +334,11 @@ def _build_full_caption(
     title: str,
     album: str = "",
     duration: int = 0,
-    lang: str = "uk",
+    lang: str = "en",
     effect_label: str = "",
 ) -> str:
     """Формує лаконічний та безпечний HTML-підпис для повного MP3 треку зі стабільною шириною."""
-    t = TEXTS.get(lang, TEXTS["uk"])
+    t = TEXTS["en"]
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
     suffix = f" <i>({html.escape(effect_label)})</i>" if effect_label else ""
@@ -477,27 +352,21 @@ def _build_full_caption(
 
 
 def _build_preview_caption(
-    artist: str, title: str, duration: int = 0, lang: str = "uk"
+    artist: str, title: str, duration: int = 0, lang: str = "en"
 ) -> str:
     """Формує безпечний HTML-підпис для 30-секундного прев'ю зі стабільною шириною."""
     safe_artist = html.escape(artist)
     safe_title = html.escape(title)
     duration_str = format_duration(duration) if duration > 0 else "—"
-    if lang == "en":
-        lines = [
-            f"🎧 <b>{safe_artist} — {safe_title}</b>",
-            f"🎤 <b>Preview:</b> 30s • <b>Track:</b> {duration_str}",
-        ]
-    else:
-        lines = [
-            f"🎧 <b>{safe_artist} — {safe_title}</b>",
-            f"🎤 <b>Прев'ю:</b> 30 сек • <b>Трек:</b> {duration_str}",
-        ]
+    lines = [
+        f"🎧 <b>{safe_artist} — {safe_title}</b>",
+        f"🎤 <b>Preview:</b> 30s • <b>Track:</b> {duration_str}",
+    ]
     return _stabilize_caption_width(lines)
 
 
 def _build_download_keyboard(
-    deezer_id: int, duration: int = 0, lang: str = "uk"
+    deezer_id: int, duration: int = 0, lang: str = "en"
 ) -> InlineKeyboardMarkup:
     """Клавіатура 2×2 для прев'ю (завантаження + основні дії однакового розміру)."""
     return _build_track_actions_keyboard(
@@ -513,7 +382,7 @@ def _build_download_keyboard(
 def _build_track_actions_keyboard(
     deezer_id: int,
     user_id: Optional[int] = None,
-    lang: str = "uk",
+    lang: str = "en",
     is_inline: bool = False,
     artist: str = "",
     include_download: bool = False,
@@ -523,17 +392,17 @@ def _build_track_actions_keyboard(
     """
     Суворо симетрична дворядкова панель дій (2×2 = 4 однакові кнопки 50%/50%):
     - Для повного MP3:
-        [ 🤍 Вибране / ❤️ Вибране ]  [ 📜 Текст ]
-        [ 🎛 Ефекти ]                [ 📻 Схожі ]
+        [ 🤍 Favorite / ❤️ Favorite ]  [ 📜 Lyrics ]
+        [ 🎛 Effects ]                 [ 📻 Similar ]
     - Для 30-сек прев'ю (include_download=True):
-        [ 📥 Скачати MP3 ]           [ 🤍 Вибране / ❤️ Вибране ]
-        [ 📜 Текст ]                 [ 🎛 Ефекти ]
+        [ 📥 Get MP3 ]                 [ 🤍 Favorite / ❤️ Favorite ]
+        [ 📜 Lyrics ]                  [ 🎛 Effects ]
     - Для треку з ефектом в інлайн-режимі (show_original_btn=True):
-        [ 💿 Оригінал ]              [ 🤍 Вибране / ❤️ Вибране ]
-        [ 📜 Текст ]                 [ 🎛 Ефекти ]
+        [ 💿 Original ]                [ 🤍 Favorite / ❤️ Favorite ]
+        [ 📜 Lyrics ]                  [ 🎛 Effects ]
     Усі кнопки мають 1 іконку + короткий підпис однакової довжини, тому ніколи не плигають.
     """
-    t = TEXTS.get(lang, TEXTS["uk"])
+    t = TEXTS["en"]
     is_fav = cache.is_favorite(user_id, deezer_id) if user_id else False
     fav_label = t["btn_fav_saved"] if is_fav else t["btn_fav_add"]
 
@@ -597,10 +466,10 @@ def _build_track_actions_keyboard(
 
 
 def _build_effects_submenu_keyboard(
-    deezer_id: int, lang: str = "uk", is_preview: bool = False
+    deezer_id: int, lang: str = "en", is_preview: bool = False
 ) -> InlineKeyboardMarkup:
     """Суворо симетричне дворядкове підменю вибору аудіо-ефектів (2×2 = 4 однакові кнопки)."""
-    t = TEXTS.get(lang, TEXTS["uk"])
+    t = TEXTS["en"]
     back_cb = f"fxbp:{deezer_id}" if is_preview else f"fxb:{deezer_id}"
     return InlineKeyboardMarkup(
         [
@@ -720,19 +589,6 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# === Command /lang ===
-async def lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда перемикання мови (Українська / English)."""
-    if not update.message:
-        return
-    lang = _get_lang(update.effective_user)
-    await update.message.reply_text(
-        TEXTS[lang]["lang_prompt"],
-        parse_mode=ParseMode.HTML,
-        reply_markup=_build_lang_keyboard(lang),
-    )
-
-
 # === Callback: Навігація з головного меню (nav:top / nav:fav) та закриття (delmsg) ===
 async def nav_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробляє кнопки Топ-чарту та Вибраного з вітального повідомлення."""
@@ -752,29 +608,25 @@ async def nav_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
 
-# === Callback: Перемикання мови (lang:uk / lang:en) ===
+# === Callback: Зворотна сумісність для старих кнопок lang:* в історії чату ===
 async def lang_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробляє натискання кнопок вибору мови."""
+    """Оновлює старе повідомлення на актуальний англійський інтерфейс без зависання спінера."""
     query = update.callback_query
     if not query or not query.data:
         return
 
-    lang = "en" if query.data.endswith(":en") else "uk"
     if query.from_user:
-        cache.set_user_lang(query.from_user.id, lang)
+        cache.set_user_lang(query.from_user.id, "en")
 
-    await query.answer(
-        "🇬🇧 Language set to English" if lang == "en" else "🇺🇦 Мову змінено на Українську"
-    )
+    await query.answer("🇬🇧 Interface language is English")
 
     if query.message:
         bot_name = html.escape(context.bot.username or "bot")
         try:
             await query.message.edit_text(
-                f"{TEXTS[lang]['lang_changed']}\n\n"
-                f"{TEXTS[lang]['welcome'].format(bot_name=bot_name)}",
+                TEXTS["en"]["welcome"].format(bot_name=bot_name),
                 parse_mode=ParseMode.HTML,
-                reply_markup=_build_welcome_keyboard(lang),
+                reply_markup=_build_welcome_keyboard("en"),
             )
         except Exception:
             pass
@@ -1182,7 +1034,7 @@ async def _ensure_full_mp3_file_id(
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     target_chat_id: Optional[int] = None,
-    lang: str = "uk",
+    lang: str = "en",
 ) -> tuple[Optional[str], bool, bool]:
     """
     Повертає (file_id, already_sent_to_target_chat, needs_bot_start).
@@ -1325,11 +1177,11 @@ async def _send_or_download_to_chat(
     chat_id: int,
     deezer_id: int,
     context: ContextTypes.DEFAULT_TYPE,
-    lang: str = "uk",
+    lang: str = "en",
     user_id: Optional[int] = None,
 ):
     """Надсилає повний MP3 у вказаний чат (з кешу або завантажує новий) з панеллю дій."""
-    t = TEXTS.get(lang, TEXTS["uk"])
+    t = TEXTS["en"]
     uid = user_id or chat_id
     track = await _resolve_track_meta(deezer_id, context)
     artist = track["artist"]
@@ -1935,7 +1787,7 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
     if parts[0] == "fx" and len(parts) >= 3 and parts[2].lstrip("-").isdigit():
         effect = parts[1]
         deezer_id = int(parts[2])
-        effect_label = EFFECT_LABELS.get(lang, EFFECT_LABELS["uk"]).get(effect, effect)
+        effect_label = EFFECT_LABELS["en"].get(effect, effect)
 
         need_heavy_fx = cache.get_effect_file_id(deezer_id, effect) is None
         if need_heavy_fx and not _try_acquire_user_job(user_id):
@@ -2250,55 +2102,34 @@ async def effects_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
 
 # === Адмін-панель (/admin або /stats) — виключно для власника бота ===
-def _format_admin_panel(lang: str = "uk") -> tuple[str, InlineKeyboardMarkup]:
+def _format_admin_panel(lang: str = "en") -> tuple[str, InlineKeyboardMarkup]:
     """Формує текст і клавіатуру адмін-панелі."""
     st = cache.get_admin_stats()
     recent_list = (
         "\n".join(f"  • {html.escape(item)}" for item in st["recent_tracks"])
         if st["recent_tracks"]
-        else ("  • (ще немає)" if lang == "uk" else "  • (none yet)")
+        else "  • (none yet)"
     )
 
-    if lang == "en":
-        text = (
-            "🛡 <b>Bot Admin Panel</b>\n\n"
-            f"👥 <b>Known users:</b> {st['users_count']}\n"
-            f"⚡ <b>Cached MP3 tracks:</b> {st['cached_mp3_count']}\n"
-            f"🎛 <b>Cached audio effects:</b> {st['cached_effects_count']}\n"
-            f"🎵 <b>Indexed track metadata:</b> {st['known_tracks_count']}\n"
-            f"❤️ <b>Saved in Favorites:</b> {st['favorites_count']}\n"
-            f"💾 <b>Database size (cache.db):</b> {st['db_size_kb']} KB\n\n"
-            f"🕐 <b>Last 5 cached tracks:</b>\n{recent_list}"
-        )
-        kb = InlineKeyboardMarkup(
+    text = (
+        "🛡 <b>Bot Admin Panel</b>\n\n"
+        f"👥 <b>Known users:</b> {st['users_count']}\n"
+        f"⚡ <b>Cached MP3 tracks:</b> {st['cached_mp3_count']}\n"
+        f"🎛 <b>Cached audio effects:</b> {st['cached_effects_count']}\n"
+        f"🎵 <b>Indexed track metadata:</b> {st['known_tracks_count']}\n"
+        f"❤️ <b>Saved in Favorites:</b> {st['favorites_count']}\n"
+        f"💾 <b>Database size (cache.db):</b> {st['db_size_kb']} KB\n\n"
+        f"🕐 <b>Last 5 cached tracks:</b>\n{recent_list}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
             [
-                [
-                    InlineKeyboardButton("🔄 Refresh", callback_data="adm:refresh"),
-                    InlineKeyboardButton("🧹 Clean Temp", callback_data="adm:cleantmp"),
-                ],
-                [InlineKeyboardButton("✖️ Close", callback_data="delmsg")],
-            ]
-        )
-    else:
-        text = (
-            "🛡 <b>Адмін-панель бота</b>\n\n"
-            f"👥 <b>Користувачів у базі:</b> {st['users_count']}\n"
-            f"⚡ <b>Закешованих MP3 треків:</b> {st['cached_mp3_count']}\n"
-            f"🎛 <b>Закешованих аудіо-ефектів:</b> {st['cached_effects_count']}\n"
-            f"🎵 <b>Треків у базі метаданих:</b> {st['known_tracks_count']}\n"
-            f"❤️ <b>Додавань у «Вибране»:</b> {st['favorites_count']}\n"
-            f"💾 <b>Розмір бази (cache.db):</b> {st['db_size_kb']} КБ\n\n"
-            f"🕐 <b>Останні 5 закешованих треків:</b>\n{recent_list}"
-        )
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("🔄 Оновити", callback_data="adm:refresh"),
-                    InlineKeyboardButton("🧹 Очистити Temp", callback_data="adm:cleantmp"),
-                ],
-                [InlineKeyboardButton("✖️ Закрити", callback_data="delmsg")],
-            ]
-        )
+                InlineKeyboardButton("🔄 Refresh", callback_data="adm:refresh"),
+                InlineKeyboardButton("🧹 Clean Temp", callback_data="adm:cleantmp"),
+            ],
+            [InlineKeyboardButton("✖️ Close", callback_data="delmsg")],
+        ]
+    )
     return text, kb
 
 
@@ -2310,8 +2141,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Для сторонніх користувачів команда повністю ігнорується
         return
 
-    lang = _get_lang(user)
-    text, kb = _format_admin_panel(lang=lang)
+    text, kb = _format_admin_panel()
     await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
@@ -2322,17 +2152,16 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if not _is_admin(query.from_user.id):
-        await query.answer("⛔ Доступ лише для адміністратора", show_alert=True)
+        await query.answer("⛔ Admin access only", show_alert=True)
         return
 
-    lang = _get_lang(query.from_user)
     if query.data == "adm:cleantmp":
         cleanup_temp_dir(include_ytdlp_cache=True)
-        await query.answer("🧹 Тимчасові папки та кеш очищено!" if lang == "uk" else "🧹 Temp & cache folders cleaned!")
+        await query.answer("🧹 Temp & cache folders cleaned!")
     else:
-        await query.answer("🔄 Оновлено" if lang == "uk" else "🔄 Refreshed")
+        await query.answer("🔄 Refreshed")
 
-    text, kb = _format_admin_panel(lang=lang)
+    text, kb = _format_admin_panel()
     if query.message:
         try:
             await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -2346,26 +2175,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
-    """Прогріває HTTP-пул до Deezer та реєструє меню команд бота."""
+    """Прогріває HTTP-пул до Deezer та реєструє англомовне меню команд бота."""
     await warmup_session()
+    commands = [
+        BotCommand("start", TEXTS["en"]["cmd_start"]),
+        BotCommand("top", TEXTS["en"]["cmd_top"]),
+        BotCommand("favorites", TEXTS["en"]["cmd_fav"]),
+    ]
     try:
-        await application.bot.set_my_commands(
-            [
-                BotCommand("start", TEXTS["uk"]["cmd_start"]),
-                BotCommand("top", TEXTS["uk"]["cmd_top"]),
-                BotCommand("favorites", TEXTS["uk"]["cmd_fav"]),
-                BotCommand("lang", TEXTS["uk"]["cmd_lang"]),
-            ]
-        )
-        await application.bot.set_my_commands(
-            [
-                BotCommand("start", TEXTS["en"]["cmd_start"]),
-                BotCommand("top", TEXTS["en"]["cmd_top"]),
-                BotCommand("favorites", TEXTS["en"]["cmd_fav"]),
-                BotCommand("lang", TEXTS["en"]["cmd_lang"]),
-            ],
-            language_code="en",
-        )
+        for lc in ("uk", "en", "ru"):
+            try:
+                await application.bot.delete_my_commands(language_code=lc)
+            except Exception:
+                pass
+        await application.bot.set_my_commands(commands)
+        await application.bot.set_my_commands(commands, language_code="en")
+        await application.bot.set_my_commands(commands, language_code="uk")
     except Exception as e:
         logger.debug(f"Could not set bot commands: {e}")
 
@@ -2404,7 +2229,6 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler(["favorites", "fav"], favorites_command))
-    app.add_handler(CommandHandler("lang", lang_command))
     app.add_handler(CommandHandler(["admin", "stats"], admin_command))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(CallbackQueryHandler(nav_callback_handler, pattern=r"^(nav:|delmsg$)"))
